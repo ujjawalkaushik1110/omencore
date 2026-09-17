@@ -28,6 +28,7 @@ internal static class Program
         rootCommand.AddCommand(PerformanceCommand.Create());
         rootCommand.AddCommand(KeyboardCommand.Create());
         rootCommand.AddCommand(MonitorCommand.Create());
+        rootCommand.AddCommand(DisplayCommand.Create());
         rootCommand.AddCommand(ConfigCommand.Create());
         rootCommand.AddCommand(WindowsCommand.Create());
         rootCommand.AddCommand(DaemonCommand.Create());
