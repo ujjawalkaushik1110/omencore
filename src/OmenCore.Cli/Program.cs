@@ -29,6 +29,7 @@ internal static class Program
         rootCommand.AddCommand(KeyboardCommand.Create());
         rootCommand.AddCommand(MonitorCommand.Create());
         rootCommand.AddCommand(ConfigCommand.Create());
+        rootCommand.AddCommand(WindowsCommand.Create());
         rootCommand.AddCommand(DaemonCommand.Create());
 
         return await rootCommand.InvokeAsync(args);
