@@ -2345,50 +2345,87 @@ namespace OmenCore.ViewModels
                 return;
             }
 
-            var preset = FanPresets.FirstOrDefault(p => 
-                p.Name.Equals(modeName, System.StringComparison.OrdinalIgnoreCase));
-            
+            var preset = ResolvePresetForModeName(modeName);
             if (preset != null)
+                SelectedPreset = preset;
+        }
+
+        /// <summary>
+        /// Same resolution and apply as <see cref="ApplyFanMode"/>, but awaits the underlying WMI
+        /// write instead of firing it and returning.
+        ///
+        /// <see cref="SelectedPreset"/>'s setter calls <c>ApplyPreset</c>, which is deliberately
+        /// fire-and-forget (<c>_ = ApplyPresetAsync(preset)</c>) so a UI-clicked preset card doesn't
+        /// block the UI thread on the WMI round trip. GitHub #199: a hotkey caller that reads
+        /// <c>_fanService.GetCurrentFanMode()</c> right after <c>ApplyFanMode</c> returns was racing
+        /// that background task, so the OSD showed the mode the fans were leaving, not the one they
+        /// were headed to - "always one step behind". This awaits the real write and returns the
+        /// preset's own name, which needs no readback race to be correct.
+        /// </summary>
+        public async Task<string?> ApplyFanModeAsync(string modeName)
+        {
+            if (_fanService.IsDiagnosticModeActive)
+            {
+                _logging.Warn($"Skipped quick fan mode '{modeName}' because fan diagnostics mode is active");
+                return null;
+            }
+
+            var preset = ResolvePresetForModeName(modeName);
+            if (preset == null) return null;
+
+            _suppressApplyOnSelection = true;
+            try
             {
                 SelectedPreset = preset;
             }
+            finally
+            {
+                _suppressApplyOnSelection = false;
+            }
+
+            await ApplyPresetAsync(preset);
+            return preset.Name;
+        }
+
+        private FanPreset? ResolvePresetForModeName(string modeName)
+        {
+            var preset = FanPresets.FirstOrDefault(p =>
+                p.Name.Equals(modeName, System.StringComparison.OrdinalIgnoreCase));
+            if (preset != null) return preset;
+
+            // Try to match partial names
+            if (FanModeNameResolver.IsMaxAlias(modeName))
+            {
+                preset = FanPresets.FirstOrDefault(p => p.Name == "Max");
+            }
+            else if (FanModeNameResolver.IsQuietAlias(modeName))
+            {
+                preset = FanPresets.FirstOrDefault(p => p.Name == "Quiet" || p.Name == "Silent")
+                    ?? FanPresets.FirstOrDefault(p => p.Name == "Auto");
+            }
+            else if (FanModeNameResolver.IsAutoAlias(modeName))
+            {
+                preset = FanPresets.FirstOrDefault(p => p.Name == "Auto")
+                    ?? FanPresets.FirstOrDefault(p => p.Name == "Balanced");
+            }
+            else if (FanModeNameResolver.IsPerformanceAlias(modeName))
+            {
+                // Prefer explicit name match: Gaming → Gaming, Extreme → Extreme.
+                // IsPerformanceAlias lumps both together; separate here to preserve cycle identity.
+                if (modeName.Contains("gaming", System.StringComparison.OrdinalIgnoreCase))
+                    preset = FanPresets.FirstOrDefault(p => p.Name == "Gaming")
+                        ?? FanPresets.FirstOrDefault(p => p.Name == "Extreme");
+                else
+                    preset = FanPresets.FirstOrDefault(p => p.Name == "Extreme")
+                        ?? FanPresets.FirstOrDefault(p => p.Name == "Gaming")
+                        ?? FanPresets.FirstOrDefault(p => p.Name == "Max");
+            }
             else
             {
-                // Try to match partial names
-                if (FanModeNameResolver.IsMaxAlias(modeName))
-                {
-                    preset = FanPresets.FirstOrDefault(p => p.Name == "Max");
-                }
-                else if (FanModeNameResolver.IsQuietAlias(modeName))
-                {
-                    preset = FanPresets.FirstOrDefault(p => p.Name == "Quiet" || p.Name == "Silent")
-                        ?? FanPresets.FirstOrDefault(p => p.Name == "Auto");
-                }
-                else if (FanModeNameResolver.IsAutoAlias(modeName))
-                {
-                    preset = FanPresets.FirstOrDefault(p => p.Name == "Auto")
-                        ?? FanPresets.FirstOrDefault(p => p.Name == "Balanced");
-                }
-                else if (FanModeNameResolver.IsPerformanceAlias(modeName))
-                {
-                    // Prefer explicit name match: Gaming → Gaming, Extreme → Extreme.
-                    // IsPerformanceAlias lumps both together; separate here to preserve cycle identity.
-                    if (modeName.Contains("gaming", System.StringComparison.OrdinalIgnoreCase))
-                        preset = FanPresets.FirstOrDefault(p => p.Name == "Gaming")
-                            ?? FanPresets.FirstOrDefault(p => p.Name == "Extreme");
-                    else
-                        preset = FanPresets.FirstOrDefault(p => p.Name == "Extreme")
-                            ?? FanPresets.FirstOrDefault(p => p.Name == "Gaming")
-                            ?? FanPresets.FirstOrDefault(p => p.Name == "Max");
-                }
-                else
-                {
-                    preset = FanPresets.FirstOrDefault(p => p.Name == "Auto");
-                }
-                
-                if (preset != null)
-                    SelectedPreset = preset;
+                preset = FanPresets.FirstOrDefault(p => p.Name == "Auto");
             }
+
+            return preset;
         }
 
         /// <summary>

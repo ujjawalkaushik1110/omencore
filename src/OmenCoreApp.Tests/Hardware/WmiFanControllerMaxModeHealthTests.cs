@@ -213,5 +213,44 @@ namespace OmenCoreApp.Tests.Hardware
             fake.RpmReadback = (500, 480);
             InvokeHealthCheck(controller, out _).Should().BeFalse("500 RPM is below the 2000 RPM floor");
         }
+
+        [Fact]
+        public void RestoreAuto_ClearsALiveMax_EvenInsideTheResetCooldown()
+        {
+            // Auto -> Max -> quit within the 5s cooldown used to skip SetFanMax(false) and leave the
+            // firmware holding the fans at maximum after OmenCore exited.
+            WmiFanController.ShouldRunMaxReset(maxModeActive: true, TimeSpan.FromSeconds(1))
+                .Should().BeTrue();
+        }
+
+        [Fact]
+        public void IgnoredMax_EscalatesToLevelCeiling_AfterRepeatedAcceptedReasserts()
+        {
+            // Some firmware accepts SetFanMax(true) and ignores it (Ohman: 8A26, 8E5E). Before, the
+            // level fallback only ran when SetFanMax returned false, so these boards re-sent an
+            // ignored Max forever while the fans sat low.
+            WmiFanController.ShouldEscalateMaxToLevelFallback(maxAccepted: true, ineffectiveReassertStreak: 1)
+                .Should().BeFalse("one accepted reassert may simply be a transient external reset");
+            WmiFanController.ShouldEscalateMaxToLevelFallback(
+                    maxAccepted: true,
+                    ineffectiveReassertStreak: WmiFanController.MaxModeIneffectiveReassertsBeforeLevelFallback)
+                .Should().BeTrue();
+        }
+
+        [Fact]
+        public void RefusedMax_StillFallsBackImmediately()
+        {
+            WmiFanController.ShouldEscalateMaxToLevelFallback(maxAccepted: false, ineffectiveReassertStreak: 0)
+                .Should().BeTrue();
+        }
+
+        [Fact]
+        public void RestoreAuto_StillThrottlesRepeatedResets_WhenMaxIsNotActive()
+        {
+            WmiFanController.ShouldRunMaxReset(maxModeActive: false, TimeSpan.FromSeconds(1))
+                .Should().BeFalse();
+            WmiFanController.ShouldRunMaxReset(maxModeActive: false, TimeSpan.FromSeconds(6))
+                .Should().BeTrue();
+        }
     }
 }

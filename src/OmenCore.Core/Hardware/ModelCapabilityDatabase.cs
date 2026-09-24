@@ -839,17 +839,9 @@ namespace OmenCore.Hardware
             });
 
             // OMEN 16 (2025) - ap0xxx AMD, alternate board/ProductId reported by RC1 testers.
-            // Community report: Product ID 8E35, SKU 1H85430PWY, AMD Ryzen AI 9 365 + RTX 5060.
-            // GitHub Issue #195: same ProductId/SKU (8E35 / 1H85430PWY), but native diagnostics on
-            // that report identify the actual CPU as Ryzen 9 8940HX (RaphaelDragonRange) instead -
-            // the two reports disagree on which CPU this board/SKU combination actually ships with,
-            // and neither has been independently re-verified against the other. Not resolved here;
-            // flagging rather than guessing since a laptop CPU is soldered and a genuine SKU-to-CPU
-            // mismatch between two reports needs a real explanation, not a pick. This entry only
-            // ever governed board-level fan/GPU-boost/lighting flags, not CPU identity or CPU-gated
-            // capabilities like undervolt - those are resolved from the live-detected CPU string
-            // elsewhere (RyzenControl/AmdUndervoltProvider), never from this Notes text, so the
-            // discrepancy has no functional effect regardless of which report is right.
+            // Community reports cover multiple configurations on this board: Ryzen AI 9 365 + RTX 5060,
+            // and Ryzen 9 8940HX + RTX 5060 (system SKU BP1Q1UA#ABA). 1H85430PWY is the latter
+            // system's ComputerSystemProduct.IdentifyingNumber, not its support product SKU.
             AddModel(new ModelCapabilities
             {
                 ProductId = "8E35",
@@ -867,8 +859,9 @@ namespace OmenCore.Hardware
                 SupportsGpuPowerBoost = true,
                 HasFourZoneRgb = true,
                 SupportsUndervolt = false,
+                AllowDecoupledWmiThermalPolicyFallback = true,
                 UserVerified = false,
-                Notes = "Discord RC1 report - OMEN Gaming Laptop 16-ap0xxx / ProductId 8E35 / SKU 1H85430PWY. CPU identity disputed: original report said Ryzen AI 9 365 + RTX 5060; GitHub #195's native diagnostics on the same ProductId/SKU show Ryzen 9 8940HX instead - unresolved, see comment above. Same WMI V1 fan profile as 8D24; EC direct remains disabled until validated."
+                Notes = "Community reports: OMEN Gaming Laptop 16-ap0xxx / ProductId 8E35, including Ryzen AI 9 365 + RTX 5060 and Ryzen 9 8940HX + RTX 5060 (system SKU BP1Q1UA#ABA; system product identifying number 1H85430PWY). Same WMI V1 fan profile as 8D24; EC direct remains disabled until validated. GitHub #195 ran a controlled Quiet-vs-Performance test confirming Direct EC writes are disabled AND the WMI thermal-policy fallback was not attempted (AllowDecoupledWmiThermalPolicyFallback was off), matching a 0.0 W CPU package power difference between modes - Performance mode was doing nothing on this board. Enabled here so Performance mode has a path to actually change anything; narrowly conditioned in PerformanceModeService on EC limits being unavailable, so it can't override a working EC path. Awaiting a re-run of the same controlled test on this change to confirm it moves CPU power."
             });
 
             // OMEN 16 (2025) - ap0xxx AMD, lower CPU/GPU tier of the same board family.
@@ -923,6 +916,35 @@ namespace OmenCore.Hardware
                 AllowV1AutoModeFloorClear = true,
                 UserVerified = true,
                 Notes = "GitHub #111 / Discord 2026-05-20 and 2026-05-21; Discord 2026-06-02 follow-up - OMEN Gaming Laptop 16-am0xxx, ProductId 8D2F. Exact board identity confirmed; product ID has appeared across AMD and Intel Core Ultra variants, so direct EC fan writes and independent curves remain disabled. WMI V1 fan/profile control is retained, WMI thermal-policy fallback is enabled for performance modes when EC/MSR power-limit writes are unavailable, and V1 auto-mode floor clear is enabled to let fans ramp down after load.",
+            });
+
+            // OMEN 16-ae0xxx (2025 Intel HX) - board 8CC0. GitHub Issue #204: OMEN Gaming Laptop
+            // 16-ae0xxx, i7-14650HX, BIOS F.19, SKU CND4160KXF, thermal policy V1 with the firmware's
+            // software-fan-control bit set. Was resolving via OMEN16 family fallback (Low confidence),
+            // whose log showed "Performance mode: nothing was applied (Direct EC writes disabled)".
+            // Flags follow the same-generation, same-thermal-policy 8D2F entry (verified) where the
+            // WMI thermal-policy fallback is what actually makes Performance take effect, but stay
+            // conservative everywhere else: fan curves, GPU boost and RGB zone layout are not
+            // claimed until a diagnostics run shows them working on this board.
+            AddModel(new ModelCapabilities
+            {
+                ProductId = "8CC0",
+                ModelName = "OMEN 16-ae0xxx (8CC0)",
+                ModelNamePattern = "16-ae0",
+                ModelYear = 2025,
+                Family = OmenModelFamily.OMEN16,
+                SupportsFanControlWmi = true,
+                SupportsFanControlEc = false,
+                SupportsFanCurves = false,
+                SupportsIndependentFanCurves = false,
+                FanZoneCount = 2,
+                SupportsPerformanceModes = true,
+                HasMuxSwitch = false,
+                SupportsGpuPowerBoost = false,
+                SupportsUndervolt = false,
+                AllowDecoupledWmiThermalPolicyFallback = true,
+                UserVerified = false,
+                Notes = "GitHub #204 - OMEN 16-ae0xxx, ProductId 8CC0, i7-14650HX + RTX 4060, BIOS F.19. Exact identity replaces OMEN16 family fallback. WMI fan/profile control retained (fans reached ~5800/6100 RPM in Performance in the reporter's bundle); WMI thermal-policy fallback enabled so Performance mode isn't a no-op when direct EC writes are unavailable, mirroring same-generation 8D2F. Fan curves, GPU boost and undervolt remain unclaimed pending a real verification run."
             });
 
             // OMEN 16 (2025) - am0xxx Intel Core Ultra H + RTX 50-series
@@ -1487,9 +1509,15 @@ namespace OmenCore.Hardware
             AddModel(new ModelCapabilities
             {
                 ProductId = "8BB1-VICTUS15",
-                ModelName = "HP Victus 15-fa1xxx (2022)",
+                // GitHub #202: this board is not year-specific. Reporter's diagnostics resolved
+                // here (WMI model "Victus by HP Gaming Laptop 15-fa1xxx", Baseboard ProductId 8BB1)
+                // on a laptop confirmed by its own model number (fa1082wm) to be a 2024 unit, not
+                // 2022 - the hardcoded "(2022)" this entry used to carry was simply wrong for their
+                // machine. The 15-fa1 name-pattern match cannot distinguish which year of that
+                // range it is looking at, so the name no longer claims one; the capability flags
+                // below are unchanged and were never year-dependent.
+                ModelName = "HP Victus 15-fa1xxx",
                 ModelNamePattern = "15-fa1",
-                ModelYear = 2022,
                 Family = OmenModelFamily.Victus,
                 SupportsFanControlWmi = true,
                 SupportsFanCurves = true,
@@ -1501,7 +1529,7 @@ namespace OmenCore.Hardware
                 HasKeyboardBacklight = true,
                 SupportsUndervolt = false,
                 UserVerified = false,
-                Notes = "Victus 15-fa1xxx — single-color backlight; shares 8BB1 product ID with OMEN 17 (2021)"
+                Notes = "Victus 15-fa1xxx — single-color backlight; shares 8BB1 product ID with OMEN 17 (2021). Spans multiple model years (GitHub #202 confirms a 2024 fa1082wm unit resolves here), so no specific year is claimed."
             });
 
             // GitHub #178: HP Victus 15-fa2303TX (C2JQ3PA), exact ProductId 8E5E. Reporter's own
@@ -1868,13 +1896,14 @@ namespace OmenCore.Hardware
                 UserVerified = false,
                 Notes = "GitHub #197 — HP Victus 15-fb3xxx, ProductId 8DD2, SKU 1H85482PX4 (2025 AMD). The exact-ProductId confirmation #148's pattern-matched entry above was waiting on; flags inherited verbatim from that entry, not independently widened. Reporter confirms no RGB keyboard, matching #148's own report."
             });
-            // HP Victus 15-fb3xxx - ProductId 8DD0.
-            // Runtime diagnostics confirmed this exact machine:
-            // Victus by HP Gaming Laptop 15-fb3xxx, ProductId 8DD0.
-            // HP Gaming Hub is known to provide fan control on this machine.
-            // The firmware SystemDesignData reports IsSwFanControlSupport=false,
-            // so this exact verified profile prevents the generic unverified
-            // template from being forced into MonitoringOnly.
+
+            // Victus 15-fb3xxx (2025 AMD) - board 8DD0. Contributed via PR #200 (ujjawalkaushik1110),
+            // who hit the v4.3.1 SystemDesignData regression on this exact board (fan control forced to
+            // monitoring-only although WMI fan writes work) and verified Max fan through WMI with
+            // level/RPM readback, manual level writes and keepalive on real hardware. The regression
+            // itself is fixed at the source, so this is an identity entry mirroring 8DD2/#148's flags.
+            // The PR marked it UserVerified; one contributor's run isn't the full verification card the
+            // project's promotion rule asks for, so it stays false until that's complete.
             AddModel(new ModelCapabilities
             {
                 ProductId = "8DD0",
@@ -1895,9 +1924,10 @@ namespace OmenCore.Hardware
                 AllowDecoupledWmiThermalPolicyFallback = true,
                 HasFourZoneRgb = false,
                 HasKeyboardBacklight = false,
-                UserVerified = true,
-                Notes = "Local diagnostics-confirmed ProductId 8DD0 on Victus by HP Gaming Laptop 15-fb3xxx. HP Gaming Hub provides fan control on this machine; exact profile used to prevent the generic unverified fb3xxx template from forcing MonitoringOnly."
+                UserVerified = false,
+                Notes = "GitHub PR #200 - HP Victus 15-fb3xxx, ProductId 8DD0, Ryzen 7 7445HS + RTX 2050, BIOS F.15. Contributor verified Max fan via WMI with level/RPM readback, manual level writes and keepalive on this board. Flags mirror 8DD2; UserVerified withheld pending a full verification pass."
             });
+
             // Victus 16 (2023/2024) - d1xxx series
             // GitHub Issue #66: Product ID 8A26 requested for capability DB.
             AddModel(new ModelCapabilities
@@ -2068,6 +2098,28 @@ namespace OmenCore.Hardware
                 Notes = "Issue #128 — explicit Victus 16-e0xxx mapping (88EC) to avoid low-confidence family fallback; feature flags intentionally conservative pending field verification. A follow-up diagnostics export confirmed 'Performance mode Balanced: nothing was applied (Direct EC writes disabled)' live in the field - this board never got the AllowDecoupledWmiThermalPolicyFallback fix already applied to 8DCD/8C30/878C/8600, so switching modes had no effect at all since Direct EC is (correctly) disabled here and no fallback path was enabled to compensate."
             });
             
+            // ═══════════════════════════════════════════════════════════════════════════════════
+            AddModel(new ModelCapabilities
+            {
+                ProductId = "88ED",
+                ModelName = "HP Victus 16-e0xxx",
+                ModelNamePattern = "16-e0",
+                ModelYear = 2022,
+                Family = OmenModelFamily.Victus,
+                SupportsFanControlWmi = true,
+                SupportsFanCurves = true,
+                SupportsIndependentFanCurves = false,
+                FanZoneCount = 2,
+                HasMuxSwitch = false,
+                SupportsGpuPowerBoost = false,
+                SupportsUndervolt = false,
+                HasFourZoneRgb = false,
+                HasKeyboardBacklight = true,
+                AllowDecoupledWmiThermalPolicyFallback = true,
+                UserVerified = false,
+                Notes = "GitHub #209 — HP Victus 16-e0005np / ProductId 88ED, Ryzen 7 5800H + RTX 3050 Ti. Exact conservative sibling of 88EC/88EE added so model identity resolves by ProductId instead of low-confidence 16-e0 model-name pattern; flags mirror 88EC's (including the AllowDecoupledWmiThermalPolicyFallback fix, since 88EC needed it for Performance-mode switching to do anything at all) rather than granting anything new — no live capability probe or field-validation-script run from this board yet."
+            });
+
             // ═══════════════════════════════════════════════════════════════════════════════════
             AddModel(new ModelCapabilities
             {

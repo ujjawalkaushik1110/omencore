@@ -15,7 +15,7 @@ namespace OmenCoreApp.Tests.Hardware
             capabilities.ProductId.Should().Be("8DD0");
             capabilities.ModelName.Should().Be("HP Victus 15 (2025) fb3xxx");
 
-            capabilities.UserVerified.Should().BeTrue();
+            capabilities.UserVerified.Should().BeFalse();
             capabilities.SupportsFanControlWmi.Should().BeTrue();
             capabilities.SupportsFanControlEc.Should().BeFalse();
             capabilities.SupportsFanCurves.Should().BeTrue();
@@ -34,7 +34,7 @@ namespace OmenCoreApp.Tests.Hardware
 
             capabilities.Should().NotBeNull();
             capabilities!.ProductId.Should().Be("8DD0");
-            capabilities.UserVerified.Should().BeTrue();
+            capabilities.UserVerified.Should().BeFalse();
             capabilities.SupportsFanControlWmi.Should().BeTrue();
         }
     }

@@ -218,22 +218,23 @@ namespace OmenCore.Hardware
                 }
             }
 
-            // Firmware-declared narrowing for unverified boards only (docs/ROADMAP_v4.3.1.md,
-            // "Cross-Project Review: What Ohman Does Differently"). HP's own SystemDesignData
-            // block - read during WMI BIOS init, well before this phase runs - is a firmware-
-            // authored capability declaration, not a guess. When it explicitly denies software
-            // fan control, that's a stronger signal than a same-family template clone assuming
-            // it works. This only ever REMOVES a capability the template guessed at; it never
-            // grants one the template didn't already claim, and it never runs for a board whose
-            // flags came from a real person's hardware (UserVerified) - those stay authoritative
-            // over a generic byte heuristic regardless of what SystemDesignData says.
+            // SystemDesignData.IsSwFanControlSupport is deliberately DIAGNOSTIC ONLY - it must never
+            // narrow a capability. v4.3.1 briefly forced monitoring-only whenever this bit read
+            // false on an unverified board, on the reasoning that a firmware-authored "no" beats a
+            // template's guess. GitHub #203 (board 8C2F), #202 (8BB1) and every field bundle since
+            // showed that reasoning was wrong: on V0-thermal-policy firmware the byte is simply
+            // not populated (raw block 'C8 00 00 00 00 ...': policy 0, flag 0), yet WMI 0x2E
+            // fan-level writes are accepted, read back from firmware, and audibly move the fans -
+            // and Custom Fan Curve that worked in 4.3.0 was switched off. The bit tells us what the
+            // firmware chose to declare, not what the hardware does; only an actual write outcome
+            // (refusal, failed readback) can say a board can't be driven, and the write paths
+            // already verify those. Logged so the disagreement stays visible in diagnostics.
             if (!model.UserVerified &&
                 _wmiBios?.SystemDesign is HpWmiBios.SystemDesignData design &&
                 !design.IsSwFanControlSupport &&
                 Capabilities.CanSetFanSpeed)
             {
-                _logging?.Warn($"  Fan control disabled per firmware SystemDesignData (IsSwFanControlSupport=false) - overrides the unverified {model.ModelName} template's assumption");
-                ForceMonitoringOnlyFanControl("Firmware SystemDesignData reports no software fan control support");
+                _logging?.Warn($"  Firmware SystemDesignData reports IsSwFanControlSupport=false (thermal policy {design.ThermalPolicyVersion}) on {model.ModelName} - not acted on: the bit reads false on V0 boards where software fan control demonstrably works, so fan control stays enabled and write outcomes decide");
             }
             
             // Fan count override

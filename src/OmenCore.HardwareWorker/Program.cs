@@ -407,7 +407,15 @@ class Program
             IsCpuEnabled = true,
             IsGpuEnabled = true,
             IsMemoryEnabled = true,
-            IsStorageEnabled = true,
+            // Storage stays off by default: LibreHardwareMonitor's SMART backend spins up its
+            // own background hot-plug listener thread once storage is enabled, and a
+            // NullReferenceException inside that thread (DiskInfoToolkit.Smart.SmartAttributeHandler
+            // .CheckSmartAttributeCorrect, seen via StorageManager.HandleUnpartitionedDrive on a
+            // plugged-in unpartitioned/raw drive) is unhandled-exception-fatal for the whole worker
+            // process - it takes down live fan/temperature telemetry until the worker respawns, not
+            // just the SSD-temperature reading it was there to provide. Confirmed from a field bundle
+            // on #199. SsdTemperature-based notifications simply won't fire while this is off.
+            IsStorageEnabled = false,
             IsBatteryEnabled = !_batteryMonitoringDisabled,
             IsMotherboardEnabled = true
         };

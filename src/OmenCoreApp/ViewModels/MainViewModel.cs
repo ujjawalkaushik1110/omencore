@@ -1492,7 +1492,7 @@ namespace OmenCore.ViewModels
             _hotkeyService = hotkeyService ?? new HotkeyService(_logging);
             // _notificationService created earlier (before FanService)
             _powerAutomationService = new PowerAutomationService(_logging, _fanService, _performanceModeService, _configService, _gpuSwitchService);
-            GpuClamp = new GpuClampViewModel(_logging, _configService, _config, _wmiBios, _undervoltService, _notificationService, _powerAutomationService);
+            GpuClamp = new GpuClampViewModel(_logging, _configService, _config, _wmiBios, _undervoltService, _notificationService, _powerAutomationService, _nvapiService, DetectedCapabilities?.ModelConfig?.ProductId);
             _automationService = new AutomationService(
                 _logging,
                 _configService,
@@ -2209,30 +2209,39 @@ namespace OmenCore.ViewModels
                 m.Name.Equals(modeName, StringComparison.OrdinalIgnoreCase));
         }
 
-        private Task RestoreDefaultSettingsAsync()
+        private async Task RestoreDefaultSettingsAsync()
         {
-            // Restore to balanced defaults
-            if (FanControl != null)
+            // GitHub #206 (diagnosed and validated on a v4.3.1 build by the reporter, board 8BD4):
+            // this used to set FanControl.SelectedPreset / SystemControl.SelectedPerformanceMode
+            // directly. That runs on the game-profile monitor's thread, so touching those
+            // WPF-bound properties could throw InvalidOperationException mid-restore - and even
+            // when it didn't, selecting them is not the full Balanced restore (power mode, Auto
+            // cooling, runtime sync, persistence), so a game exit could leave Performance mode
+            // active with fans back on Auto. GeneralViewModel.ApplyBalancedProfile() already does
+            // the complete restore; run it on the UI thread.
+            var dispatcher = Application.Current?.Dispatcher;
+            if (dispatcher == null)
             {
-                var balanced = FanControl.FanPresets.FirstOrDefault(p => p.Name == "Balanced");
-                if (balanced != null)
-                {
-                    FanControl.SelectedPreset = balanced;
-                }
+                _logging.Warn("Cannot restore game-profile defaults: UI dispatcher unavailable");
+                return;
             }
 
-            if (SystemControl != null)
+            if (General == null)
             {
-                var balanced = SystemControl.PerformanceModes.FirstOrDefault(m => m.Name == "Balanced");
-                if (balanced != null)
-                {
-                    SystemControl.SelectedPerformanceMode = balanced;
-                }
+                _logging.Warn("Cannot restore game-profile defaults: General view model unavailable");
+                return;
             }
 
-            _logging.Info("✓ Restored default settings");
+            if (dispatcher.CheckAccess())
+            {
+                General.ApplyBalancedProfile();
+            }
+            else
+            {
+                await dispatcher.InvokeAsync(() => General.ApplyBalancedProfile());
+            }
 
-            return Task.CompletedTask;
+            _logging.Info("✓ Restored default settings via Balanced profile");
         }
 
         private void OpenGameProfileManager(GameProfile? initialProfile = null)
@@ -3575,18 +3584,21 @@ namespace OmenCore.ViewModels
 
         private void OnHotkeyToggleFanMode(object? sender, EventArgs e)
         {
-            _hotkeyCoordinator.EnqueueUiAction("ToggleFanMode", () =>
+            _hotkeyCoordinator.EnqueueUiAction("ToggleFanMode", async () =>
             {
                 if (FanControl == null) return;
 
                 var currentCycleMode = ResolveHotkeyFanCycleMode();
                 var nextMode = ResolveNextHotkeyFanMode(currentCycleMode, out var targetMode);
-                
+
                 try
                 {
-                    FanControl.ApplyFanMode(targetMode);
-
-                    var confirmedFanMode = _fanService.GetCurrentFanMode()
+                    // Awaited, not fire-and-forget (GitHub #199): ApplyFanMode's underlying write
+                    // runs on a background Task, so reading _fanService.GetCurrentFanMode()
+                    // immediately after it returned a stale mode - the OSD showed the mode the
+                    // fans were leaving, one hotkey press behind the one actually requested.
+                    var confirmedFanMode = await FanControl.ApplyFanModeAsync(targetMode)
+                        ?? _fanService.GetCurrentFanMode()
                         ?? _fanService.ActivePresetName
                         ?? nextMode;
 

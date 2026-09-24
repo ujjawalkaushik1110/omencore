@@ -554,6 +554,35 @@ namespace OmenCoreApp.Tests.ViewModels
         }
 
         [Fact]
+        public async Task ApplyFanModeAsync_HasAppliedThePreset_BeforeItReturns()
+        {
+            // GitHub #199: ApplyFanMode's underlying write is fire-and-forget (SelectedPreset's
+            // setter starts it and returns immediately), so a caller reading fan-service state
+            // right after ApplyFanMode returned could still see the mode being left. This is the
+            // awaited path a hotkey handler needs instead.
+            var vm = CreateViewModel();
+            var fanService = GetFanService(vm);
+
+            var confirmedName = await vm.ApplyFanModeAsync("Quiet");
+
+            confirmedName.Should().Be("Quiet");
+            vm.SelectedPreset?.Name.Should().Be("Quiet");
+            (fanService.GetCurrentFanMode() ?? fanService.ActivePresetName).Should().Be("Quiet",
+                "the fan service's own state must already reflect the applied mode once the awaited call returns");
+        }
+
+        [Fact]
+        public async Task ApplyFanModeAsync_ResolvesAliases_TheSameWayAsApplyFanMode()
+        {
+            var vm = CreateViewModel();
+
+            var confirmedName = await vm.ApplyFanModeAsync("performance");
+
+            confirmedName.Should().NotBeNullOrEmpty();
+            vm.SelectedPreset.Should().NotBeNull("a performance-alias mode name should resolve to a real preset, same as the sync ApplyFanMode path");
+        }
+
+        [Fact]
         public void DeleteSelectedPresetCommand_Requeries_WhenSelectedPresetChanges()
         {
             var vm = CreateViewModel();

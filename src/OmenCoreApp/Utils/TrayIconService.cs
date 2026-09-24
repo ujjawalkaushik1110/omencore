@@ -881,7 +881,7 @@ namespace OmenCore.Utils
         {
             try
             {
-                var rate = _displayService.GetCurrentRefreshRate();
+                var rate = _displayService.GetCurrentRefreshRate(_displayService.ResolveLaptopPanelTarget());
                 return rate > 0 ? $"{rate}Hz" : "Display";
             }
             catch

@@ -19,8 +19,14 @@ namespace OmenCore.Hardware
         private bool _moduleLoaded;
         private bool _disposed;
 
-        // Embedded LpcACPIEC.amx module binary (compiled PawnIO module)
-        // This is the pre-compiled LpcACPIEC module from PawnIO.Modules releases
+        // The compiled LpcACPIEC PawnIO module, read from disk by LoadEcModule and cached here.
+        //
+        // NOT embedded in the assembly, despite how a cached static byte[] reads. PublishSingleFile
+        // bundles managed assemblies, not `None` content items, and IncludeAllContentForSelfExtract
+        // is deliberately off — so drivers\LpcACPIEC.bin has to ship as a loose file beside the exe.
+        // A deployment that copies only OmenCore.exe loses EC access, undervolt and the APU clamp in
+        // one go, and the only symptom is the "No EC" badge. The installer gets this right by taking
+        // the publish directory with recursesubdirs; hand-assembled drops are where it goes wrong.
         private static byte[]? _lpcAcpiEcModule;
 
         // ACPI EC standard ports
@@ -233,7 +239,13 @@ namespace OmenCore.Hardware
                     }
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                // A registry read this can fail on is an unusual machine, and the fallback below
+                // silently covers it - which is exactly why it is worth a line. Someone debugging
+                // "No EC" wants to know the lookup threw rather than found nothing.
+                System.Diagnostics.Debug.WriteLine($"[PawnIO] Install-path registry lookup failed: {ex.Message}");
+            }
 
             // Fallback to default location
             string defaultPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "PawnIO");
@@ -552,6 +564,130 @@ namespace OmenCore.Hardware
             
             // Should not reach here, but if it does, throw the last exception
             throw lastException ?? new TimeoutException("EC write failed after retries");
+        }
+
+        /// <summary>
+        /// Addresses <see cref="HoldByteAndFire"/> may pin. Deliberately separate from
+        /// <see cref="AllowedWriteAddresses"/>: that allowlist gates single, retried, mutex-scoped-
+        /// per-call writes, which is a different and much lower-risk write pattern than holding the
+        /// EC mutex across a spin loop plus a synchronous WMI call. Nothing should be added here
+        /// without the same board-scoped, outcome-verified evidence <c>docs/8D87-OMEN-MAX-16-SUPPORT-PLAN.md</c>
+        /// §5.2 requires for the two entries below - 0x59 (OGHP/DBST) and 0x90 (PROH) on board 8D87.
+        /// </summary>
+        private static readonly HashSet<ushort> AllowedHoldAddresses = new() { 0x59, 0x90 };
+
+        /// <summary>
+        /// Pin one EC byte to <paramref name="setBits"/> (preserving whatever <paramref name="preserveMask"/>
+        /// marks as not-ours) for up to <paramref name="holdBudget"/>, then run <paramref name="duringHold"/>
+        /// once while STILL holding the EC mutex and the pin, then restore the byte's original value
+        /// and release.
+        ///
+        /// THE ONE THING THIS METHOD EXISTS TO FIX. <see cref="WriteByte"/> acquires <see cref="EcMutex"/>
+        /// and releases it on every single call, and ends every write with <c>Thread.Sleep(1)</c> - which
+        /// yields the rest of a scheduler quantum, commonly 1-15 ms. A caller that needs to hold one EC
+        /// bit against the firmware's own ~100 ms reassertion cycle for a ~2 ms window, per
+        /// <c>docs/8D87-OMEN-MAX-16-SUPPORT-PLAN.md</c> §5.1, cannot do that through per-call writes: the
+        /// sleep alone can exceed the entire window. This acquires the mutex ONCE for the whole
+        /// operation and spins on the raw port write with no sleep between iterations.
+        ///
+        /// <paramref name="duringHold"/> runs INSIDE the mutex hold, immediately after the pin loop, on
+        /// purpose - per the design doc, the WMI trigger that reads this EC state through ACPI must fire
+        /// while the byte is still freshly pinned, not after some other writer (fan control, tuning) has
+        /// had a chance to run first. A synchronous WMI call and a raw EC port write are different
+        /// transports with no shared lock, so holding <see cref="EcMutex"/> across it cannot deadlock -
+        /// it only makes every OTHER EC consumer wait for the WMI round trip, same as they already wait
+        /// for any other single EC operation.
+        ///
+        /// ORIGINAL VALUE IS ALWAYS RESTORED before the mutex is released, success or failure. This
+        /// method does not decide what OGHP or PROH should end up holding long-term - a caller that wants
+        /// the effect to persist is expected to have already gotten it (the WMI trigger's resulting
+        /// firmware Notify is not retracted when the pin is released; see the design doc §1) rather than
+        /// leaning on this method to leave a bit changed.
+        /// </summary>
+        /// <param name="address">Must be in <see cref="AllowedHoldAddresses"/>.</param>
+        /// <param name="preserveMask">Bits of the original byte to keep untouched.</param>
+        /// <param name="setBits">Bits to force to 1 outside <paramref name="preserveMask"/>.</param>
+        /// <param name="holdBudget">Upper bound on the pin loop's own duration. A hard ceiling, not a
+        /// target - the loop exits as soon as it is elapsed, it does not wait to fill it.</param>
+        /// <param name="duringHold">Run once, synchronously, while the pin and the mutex are both still
+        /// held. Its return value is this method's return value.</param>
+        public T HoldByteAndFire<T>(ushort address, byte preserveMask, byte setBits, TimeSpan holdBudget, Func<T> duringHold)
+        {
+            if (duringHold == null) throw new ArgumentNullException(nameof(duringHold));
+            if (!AllowedHoldAddresses.Contains(address))
+            {
+                throw new UnauthorizedAccessException(
+                    $"EC address 0x{address:X2} is not on the hold-and-fire allowlist. This is a " +
+                    "board-scoped, high-risk write pattern; see PawnIOEcAccess.AllowedHoldAddresses.");
+            }
+
+            EnsureAvailable();
+
+            bool gotMutex = EcMutex.WaitOne(EC_TIMEOUT_MS * (EC_CONFLICT_MAX_RETRIES + 1));
+            if (!gotMutex)
+            {
+                throw new TimeoutException(
+                    "Failed to acquire EC mutex for a hold-and-fire operation - another application " +
+                    "holds EC access.");
+            }
+
+            try
+            {
+                byte original = ReadByteRaw(address);
+                byte pinned = (byte)((original & preserveMask) | setBits);
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                while (sw.Elapsed < holdBudget)
+                {
+                    WriteByteRaw(address, pinned);
+                }
+
+                try
+                {
+                    return duringHold();
+                }
+                finally
+                {
+                    // Restore even if duringHold threw - never leave the firmware's own EC RAM
+                    // holding a value this process invented, only what firing the trigger needed.
+                    WriteByteRaw(address, original);
+                }
+            }
+            finally
+            {
+                EcMutex.ReleaseMutex();
+            }
+        }
+
+        /// <summary>
+        /// The command/address/data sequence <see cref="ReadByteWithRetry"/> uses, without the mutex
+        /// acquire/release or the retry loop - the caller already holds the mutex for the whole
+        /// operation. Never call this without holding <see cref="EcMutex"/> first.
+        /// </summary>
+        private byte ReadByteRaw(ushort address)
+        {
+            if (!WaitForInputBufferEmpty()) throw new TimeoutException("EC input buffer not empty");
+            WritePort(EC_CMD_PORT, EC_CMD_READ);
+            if (!WaitForInputBufferEmpty()) throw new TimeoutException("EC input buffer not empty after command");
+            WritePort(EC_DATA_PORT, (byte)address);
+            if (!WaitForOutputBufferFull()) throw new TimeoutException("EC output buffer not full");
+            return ReadPort(EC_DATA_PORT);
+        }
+
+        /// <summary>
+        /// The command/address/data sequence <see cref="WriteByteWithRetry"/> uses, without the mutex
+        /// acquire/release, the retry loop, or the trailing <c>Thread.Sleep(1)</c> - that sleep is
+        /// exactly what makes a tight pin loop impossible through the normal write path. Never call
+        /// this without holding <see cref="EcMutex"/> first.
+        /// </summary>
+        private void WriteByteRaw(ushort address, byte value)
+        {
+            if (!WaitForInputBufferEmpty()) throw new TimeoutException("EC input buffer not empty");
+            WritePort(EC_CMD_PORT, EC_CMD_WRITE);
+            if (!WaitForInputBufferEmpty()) throw new TimeoutException("EC input buffer not empty after command");
+            WritePort(EC_DATA_PORT, (byte)address);
+            if (!WaitForInputBufferEmpty()) throw new TimeoutException("EC input buffer not empty after address");
+            WritePort(EC_DATA_PORT, value);
         }
 
         private bool WaitForInputBufferEmpty()

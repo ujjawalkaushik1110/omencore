@@ -106,6 +106,13 @@ namespace OmenCore.Hardware
         // max when readback telemetry indicates a sustained drop.
         private DateTime _lastMaxModeMaintenanceUtc = DateTime.MinValue;
         private int _maxModeLowTelemetryStreak = 0;
+
+        // Consecutive SetFanMax(true) reasserts the firmware ACCEPTED while fan telemetry stayed
+        // below the Max floor. Some boards return success for Max and ignore it (Ohman v1.2.1 names
+        // 8A26 and 8E5E; our own #178 8E5E verification failed at CPU@100%), so acceptance alone
+        // never reached the level fallback below - it only ran when SetFanMax returned false.
+        private int _maxModeIneffectiveReassertStreak = 0;
+        internal const int MaxModeIneffectiveReassertsBeforeLevelFallback = 2;
         private int _maxModeTelemetryUnavailableStreak = 0;
         private DateTime _lastManualModeReapplyUtc = DateTime.MinValue;
         private DateTime _lastPresetModeReapplyUtc = DateTime.MinValue;
@@ -998,6 +1005,9 @@ namespace OmenCore.Hardware
         /// <summary>
         /// Restore automatic fan control.
         /// </summary>
+        internal static bool ShouldRunMaxReset(bool maxModeActive, TimeSpan sinceLastReset) =>
+            maxModeActive || sinceLastReset.TotalSeconds >= AutoResetCooldownSeconds;
+
         public bool RestoreAutoControl()
         {
             // Stop the Max-mode keepalive/reassertion timer unconditionally and first, before
@@ -1032,7 +1042,11 @@ namespace OmenCore.Hardware
                 if (shouldRunReset)
                 {
                     var nowUtc = DateTime.UtcNow;
-                    if ((nowUtc - _lastAutoResetUtc).TotalSeconds >= AutoResetCooldownSeconds)
+                    // The cooldown exists to stop repeated resets hammering the firmware, never to
+                    // leave Max latched: Auto -> Max -> quit inside the window used to skip the
+                    // SetFanMax(false) step, then mark Max inactive anyway, so the firmware kept the
+                    // fans at maximum after OmenCore exited. A live Max always gets its reset.
+                    if (ShouldRunMaxReset(_isMaxModeActive, nowUtc - _lastAutoResetUtc))
                     {
                         ResetFromMaxMode();
                         _lastAutoResetUtc = nowUtc;
@@ -1816,6 +1830,7 @@ namespace OmenCore.Hardware
                         if (telemetryHealthy)
                         {
                             _maxModeLowTelemetryStreak = 0;
+                            _maxModeIneffectiveReassertStreak = 0;
                             TryExtendFanCountdown(nowUtc);
                             _logging?.Debug($"Max mode maintained via countdown keepalive ({healthDetails})");
                             return;
@@ -1833,21 +1848,33 @@ namespace OmenCore.Hardware
                         _lastMaxModeExternalResetUtc = DateTime.UtcNow;
                         _lastMaxModeExternalResetDetails = resetDetails;
 
-                        if (_wmiBios.SetFanMax(true))
+                        var maxAccepted = _wmiBios.SetFanMax(true);
+                        if (maxAccepted)
                         {
+                            _maxModeIneffectiveReassertStreak++;
                             _logging?.Warn($"External fan reset suspected - Max mode re-applied after sustained drop ({healthDetails})");
                             AddCommandToHistory("SetFanMax(true)", true, resetDetails, null, GetCurrentFanRpm());
                         }
-                        else
+
+                        if (ShouldEscalateMaxToLevelFallback(maxAccepted, _maxModeIneffectiveReassertStreak))
                         {
-                            _logging?.Warn("External fan reset suspected - failed to re-apply Max mode, trying fallback");
-                            AddCommandToHistory("SetFanMax(true)", false, resetDetails, null, GetCurrentFanRpm());
+                            if (maxAccepted)
+                            {
+                                _logging?.Warn($"Firmware keeps accepting Max without the fans responding " +
+                                               $"({_maxModeIneffectiveReassertStreak} reasserts) - driving fan level to the ceiling instead");
+                            }
+                            else
+                            {
+                                _logging?.Warn("External fan reset suspected - failed to re-apply Max mode, trying fallback");
+                                AddCommandToHistory("SetFanMax(true)", false, resetDetails, null, GetCurrentFanRpm());
+                            }
                             // Fallback: send ceiling value (100) — let BIOS clamp to hardware max
                             var fallbackSucceeded = _wmiBios.SetFanLevel((byte)MaxFanLevelCeiling, (byte)MaxFanLevelCeiling);
                             AddCommandToHistory(
                                 $"SetFanLevel({MaxFanLevelCeiling}, {MaxFanLevelCeiling})",
                                 fallbackSucceeded,
-                                $"{resetDetails}; SetFanMax(true) failed, fallback {(fallbackSucceeded ? "sent" : "failed")}.",
+                                $"{resetDetails}; SetFanMax(true) {(maxAccepted ? "accepted but ineffective" : "failed")}, " +
+                                $"fallback {(fallbackSucceeded ? "sent" : "failed")}.",
                                 null,
                                 GetCurrentFanRpm());
                         }
@@ -2104,9 +2131,13 @@ namespace OmenCore.Hardware
         /// entry and exit so an observed peak learned during one hold can never leak into the
         /// next one (a stale peak from a previous session would lower the drop-detection bar).
         /// </summary>
+        internal static bool ShouldEscalateMaxToLevelFallback(bool maxAccepted, int ineffectiveReassertStreak) =>
+            !maxAccepted || ineffectiveReassertStreak >= MaxModeIneffectiveReassertsBeforeLevelFallback;
+
         private void ResetMaxModeHealthTracking()
         {
             _maxModeLowTelemetryStreak = 0;
+            _maxModeIneffectiveReassertStreak = 0;
             _maxModeTelemetryUnavailableStreak = 0;
             _maxModeObservedPeakLevel = 0;
             _maxModeLevelObservationCount = 0;

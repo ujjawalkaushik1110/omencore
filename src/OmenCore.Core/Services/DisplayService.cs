@@ -111,7 +111,180 @@ namespace OmenCore.Services
             public string DeviceKey;
         }
 
+        // CCD (Connecting and Configuring Displays) API - the only Windows API that says which
+        // output is the laptop's own panel. EnumDisplayDevices cannot: it knows "primary", and a
+        // docked laptop's primary is usually the external monitor.
+        [DllImport("user32.dll")]
+        private static extern int GetDisplayConfigBufferSizes(uint flags, out uint numPathArrayElements, out uint numModeInfoArrayElements);
+
+        [DllImport("user32.dll")]
+        private static extern int QueryDisplayConfig(
+            uint flags,
+            ref uint numPathArrayElements,
+            [Out] DISPLAYCONFIG_PATH_INFO[] pathArray,
+            ref uint numModeInfoArrayElements,
+            IntPtr modeInfoArray,
+            IntPtr currentTopologyId);
+
+        [DllImport("user32.dll")]
+        private static extern int DisplayConfigGetDeviceInfo(ref DISPLAYCONFIG_SOURCE_DEVICE_NAME requestPacket);
+
+        private const uint QDC_ONLY_ACTIVE_PATHS = 0x2;
+        private const int ERROR_SUCCESS = 0;
+        private const int ERROR_INSUFFICIENT_BUFFER = 122;
+        private const uint DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME = 1;
+        private const int DisplayConfigModeInfoSize = 64;
+
+        // DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY values that mean "built into this machine".
+        private const uint OutputTechLvds = 6;
+        private const uint OutputTechDisplayPortEmbedded = 11;
+        private const uint OutputTechUdiEmbedded = 13;
+        private const uint OutputTechInternal = 0x80000000;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LUID
+        {
+            public uint LowPart;
+            public int HighPart;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct DISPLAYCONFIG_PATH_SOURCE_INFO
+        {
+            public LUID adapterId;
+            public uint id;
+            public uint modeInfoIdx;
+            public uint statusFlags;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct DISPLAYCONFIG_RATIONAL
+        {
+            public uint Numerator;
+            public uint Denominator;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct DISPLAYCONFIG_PATH_TARGET_INFO
+        {
+            public LUID adapterId;
+            public uint id;
+            public uint modeInfoIdx;
+            public uint outputTechnology;
+            public uint rotation;
+            public uint scaling;
+            public DISPLAYCONFIG_RATIONAL refreshRate;
+            public uint scanLineOrdering;
+            public int targetAvailable;
+            public uint statusFlags;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct DISPLAYCONFIG_PATH_INFO
+        {
+            public DISPLAYCONFIG_PATH_SOURCE_INFO sourceInfo;
+            public DISPLAYCONFIG_PATH_TARGET_INFO targetInfo;
+            public uint flags;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct DISPLAYCONFIG_DEVICE_INFO_HEADER
+        {
+            public uint type;
+            public uint size;
+            public LUID adapterId;
+            public uint id;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct DISPLAYCONFIG_SOURCE_DEVICE_NAME
+        {
+            public DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+            public string viewGdiDeviceName;
+        }
+
         #endregion
+
+        // Marshalled sizes, pinned by tests against the Windows SDK (72 and 84 bytes). A layout
+        // mistake here does not throw - it returns a plausible wrong panel.
+        internal static int PathInfoMarshalSize => Marshal.SizeOf<DISPLAYCONFIG_PATH_INFO>();
+        internal static int SourceDeviceNameMarshalSize => Marshal.SizeOf<DISPLAYCONFIG_SOURCE_DEVICE_NAME>();
+
+        /// <summary>
+        /// Whether a CCD output technology is the machine's own panel rather than an external port.
+        /// </summary>
+        internal static bool IsInternalOutputTechnology(uint outputTechnology) =>
+            outputTechnology == OutputTechInternal ||
+            outputTechnology == OutputTechDisplayPortEmbedded ||
+            outputTechnology == OutputTechUdiEmbedded ||
+            outputTechnology == OutputTechLvds;
+
+        /// <summary>
+        /// GDI device name (e.g. <c>\\.\DISPLAY1</c>) of the laptop's built-in panel, or null when
+        /// no active internal panel is found (lid closed, desktop, or the query failed).
+        /// </summary>
+        public string? GetInternalPanelDeviceName()
+        {
+            try
+            {
+                for (int attempt = 0; attempt < 3; attempt++)
+                {
+                    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, out var numPaths, out var numModes) != ERROR_SUCCESS)
+                        return null;
+
+                    var paths = new DISPLAYCONFIG_PATH_INFO[numPaths];
+                    var modes = Marshal.AllocHGlobal((int)Math.Max(1, numModes) * DisplayConfigModeInfoSize);
+                    try
+                    {
+                        int result = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, ref numPaths, paths, ref numModes, modes, IntPtr.Zero);
+                        if (result == ERROR_INSUFFICIENT_BUFFER) continue; // topology changed between the two calls
+                        if (result != ERROR_SUCCESS) return null;
+
+                        for (int i = 0; i < numPaths; i++)
+                        {
+                            if (!IsInternalOutputTechnology(paths[i].targetInfo.outputTechnology)) continue;
+
+                            var request = new DISPLAYCONFIG_SOURCE_DEVICE_NAME
+                            {
+                                header = new DISPLAYCONFIG_DEVICE_INFO_HEADER
+                                {
+                                    type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                                    size = (uint)Marshal.SizeOf<DISPLAYCONFIG_SOURCE_DEVICE_NAME>(),
+                                    adapterId = paths[i].sourceInfo.adapterId,
+                                    id = paths[i].sourceInfo.id
+                                }
+                            };
+
+                            if (DisplayConfigGetDeviceInfo(ref request) == ERROR_SUCCESS &&
+                                !string.IsNullOrWhiteSpace(request.viewGdiDeviceName))
+                            {
+                                return request.viewGdiDeviceName;
+                            }
+                        }
+
+                        return null;
+                    }
+                    finally
+                    {
+                        Marshal.FreeHGlobal(modes);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Internal panel detection failed: {ex.Message}");
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// The display a laptop refresh-rate shortcut should act on: the built-in panel when one is
+        /// active, otherwise the primary display (null), which is what these shortcuts always used.
+        /// Docked with an external monitor set as primary, "primary" used to mean the external one.
+        /// </summary>
+        public string? ResolveLaptopPanelTarget() => GetInternalPanelDeviceName();
 
         /// <summary>
         /// Get the current refresh rate of the primary display.
@@ -289,7 +462,7 @@ namespace OmenCore.Services
         /// <returns>The new refresh rate, or 0 if failed</returns>
         public int ToggleRefreshRate()
         {
-            return ToggleRefreshRate(null);
+            return ToggleRefreshRate(ResolveLaptopPanelTarget());
         }
 
         /// <summary>
@@ -375,9 +548,11 @@ namespace OmenCore.Services
         /// </summary>
         public bool SetHighRefreshRate()
         {
-            var available = GetAvailableRefreshRates();
+            var panel = ResolveLaptopPanelTarget();
+            var available = GetAvailableRefreshRates(panel);
+            if (available.Count == 0) return false;
             int target = available.Contains(HighRefreshRate) ? HighRefreshRate : available.Max();
-            return SetRefreshRate(target);
+            return SetRefreshRate(target, panel);
         }
 
         /// <summary>
@@ -385,9 +560,11 @@ namespace OmenCore.Services
         /// </summary>
         public bool SetLowRefreshRate()
         {
-            var available = GetAvailableRefreshRates();
+            var panel = ResolveLaptopPanelTarget();
+            var available = GetAvailableRefreshRates(panel);
+            if (available.Count == 0) return false;
             int target = available.Contains(LowRefreshRate) ? LowRefreshRate : available.Min();
-            return SetRefreshRate(target);
+            return SetRefreshRate(target, panel);
         }
 
         /// <summary>

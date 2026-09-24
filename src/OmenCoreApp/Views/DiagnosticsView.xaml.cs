@@ -77,6 +77,43 @@ namespace OmenCore.Views
             }
         }
 
+        /// <summary>
+        /// Confirm before pinning the EC gates. Stronger language than
+        /// <see cref="ApplyAdapterOverride_Click"/>'s dialog on purpose - this is a different,
+        /// higher-risk mechanism (see GpuTgpUnlockService's own remarks), not a variant of the same
+        /// one, and the documented failure mode is a degraded GPU that only cleared on reboot, not a
+        /// few seconds of black screen.
+        /// </summary>
+        private void EngageGpuTgpUnlock_Click(object sender, System.Windows.RoutedEventArgs e)
+        {
+            if (DataContext is not ViewModels.MainViewModel vm) return;
+
+            var answer = System.Windows.MessageBox.Show(
+                "This is an experimental, unconfirmed feature that pins two firmware-managed EC " +
+                "bits open for a moment and fires one WMI command, then measures whether the GPU's " +
+                "power actually moved.\n\n" +
+                "It has not been run on real hardware by anyone who wrote it. During the " +
+                "investigation it is built from, forcing this same mechanism on an undersized power " +
+                "adapter left the GPU in a degraded state - driver calls taking 20+ seconds, unable " +
+                "to render - that did not clear until the machine was rebooted, on hardware with a " +
+                "history of GPU-driver crashes.\n\n" +
+                "This offer only appears when the connected adapter is well above this machine's " +
+                "rated requirement, which is the one safeguard behind it. There is no way to preview " +
+                "the result, and no undo beyond a reboot if something goes wrong.\n\n" +
+                "Try it anyway?",
+                "Try the experimental GPU power unlock?",
+                System.Windows.MessageBoxButton.YesNo,
+                System.Windows.MessageBoxImage.Warning,
+                System.Windows.MessageBoxResult.No);
+
+            if (answer != System.Windows.MessageBoxResult.Yes) return;
+
+            if (vm.GpuClamp.EngageGpuTgpUnlockCommand.CanExecute(null))
+            {
+                vm.GpuClamp.EngageGpuTgpUnlockCommand.Execute(null);
+            }
+        }
+
         private void OpenDiagnosticsFolder_Click(object sender, System.Windows.RoutedEventArgs e)
         {
             var logDir = App.Logging.LogDirectory;

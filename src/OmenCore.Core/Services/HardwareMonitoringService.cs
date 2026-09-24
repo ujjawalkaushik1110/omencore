@@ -32,7 +32,14 @@ namespace OmenCore.Services
         // for a few consecutive samples, back off far further than the existing idle/tray-only
         // tiers while any window-active/overlay cadence is left untouched, so this only affects
         // background cost, never perceived responsiveness while someone is actually watching.
-        private readonly TimeSpan _gpuDeepIdleCadenceInterval = TimeSpan.FromMinutes(2);
+        // Must stay well under HardwareWatchdogService.FreezeThresholdSeconds: the watchdog treats
+        // "no monitoring sample for that long" as frozen sensors and forces fans to 90%. v4.3.1
+        // shipped this at 2 minutes, which outlasted the 90s limit, so every tray-only idle stretch
+        // tripped the watchdog roughly every two minutes and pinned real fans at 90% (GitHub #203
+        // and field bundles from board 8BD4). Thermal protection also only sees a new temperature
+        // once per cadence tick, so a long interval means slower reaction to a sudden load.
+        internal static readonly TimeSpan GpuDeepIdleCadence = TimeSpan.FromSeconds(30);
+        private readonly TimeSpan _gpuDeepIdleCadenceInterval = GpuDeepIdleCadence;
         private const double GpuIdleUtilizationThresholdPercent = 1.0;
         private const double GpuIdlePowerThresholdWatts = 12.0;
         private const int GpuIdleReadingsRequired = 3;
@@ -42,6 +49,22 @@ namespace OmenCore.Services
         private volatile bool _uiWindowActive = true; // Thread-safe cache updated by the UI thread via SetUiWindowActive()
         private volatile bool _trayOnlyMode; // True when UI is hidden to tray and no active fan curve/hold requires fast updates
         private volatile bool _overlayRealtimeMode; // True while in-game OSD overlay is visible and requires responsive telemetry cadence
+        // The loop sleeps for a full cadence between samples. Without a way to cut that sleep short,
+        // opening the window, showing the OSD, or leaving low-overhead mode only took effect after the
+        // sleep that was already in progress ended - invisible at a 10s tray cadence, but v4.3.1's 2-minute
+        // deep-idle cadence turned it into "the OSD / General page takes minutes to show numbers".
+        private readonly object _cadenceWakeLock = new();
+        private CancellationTokenSource? _cadenceWaitCts;
+
+        /// <summary>Ends the monitor loop's current inter-sample sleep so a cadence change applies now.</summary>
+        private void WakeMonitorLoop()
+        {
+            lock (_cadenceWakeLock)
+            {
+                _cadenceWaitCts?.Cancel();
+            }
+        }
+
         private MonitoringSample? _lastSample;
 
         /// <summary>
@@ -216,6 +239,7 @@ namespace OmenCore.Services
 
         public void SetLowOverheadMode(bool enabled)
         {
+            var changed = _lowOverheadMode != enabled;
             _lowOverheadMode = enabled;
             _logging.Info($"Hardware monitoring low overhead mode changed: {enabled}");
             
@@ -226,6 +250,7 @@ namespace OmenCore.Services
             }
 
             UpdateBridgeSamplingPolicy();
+            if (changed) WakeMonitorLoop();
         }
 
         private TimeSpan GetEffectiveCadenceInterval()
@@ -293,8 +318,10 @@ namespace OmenCore.Services
         /// </summary>
         public void SetUiWindowActive(bool active)
         {
+            var changed = _uiWindowActive != active;
             _uiWindowActive = active;
             UpdateBridgeSamplingPolicy();
+            if (changed) WakeMonitorLoop();
         }
 
         /// <summary>
@@ -306,8 +333,10 @@ namespace OmenCore.Services
         /// </summary>
         public void SetTrayOnlyMode(bool trayOnly)
         {
+            var changed = _trayOnlyMode != trayOnly;
             _trayOnlyMode = trayOnly;
             UpdateBridgeSamplingPolicy();
+            if (changed) WakeMonitorLoop();
         }
 
         /// <summary>
@@ -316,8 +345,10 @@ namespace OmenCore.Services
         /// </summary>
         public void SetOverlayRealtimeMode(bool enabled)
         {
+            var changed = _overlayRealtimeMode != enabled;
             _overlayRealtimeMode = enabled;
             UpdateBridgeSamplingPolicy();
+            if (changed) WakeMonitorLoop();
         }
 
         private void UpdateBridgeSamplingPolicy()
@@ -732,9 +763,32 @@ namespace OmenCore.Services
                 try
                 {
                     // Unified cadence policy for all monitoring consumers.
-                    var delay = GetEffectiveCadenceInterval();
-                    UpdateCadenceTelemetry(delay);
-                    await Task.Delay(delay, token);
+                    // Register the wake source BEFORE reading the cadence, so a mode change that lands
+                    // between the read and the sleep still cuts the sleep short instead of being missed.
+                    CancellationTokenSource waitCts;
+                    lock (_cadenceWakeLock)
+                    {
+                        waitCts = _cadenceWaitCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    }
+
+                    try
+                    {
+                        var delay = GetEffectiveCadenceInterval();
+                        UpdateCadenceTelemetry(delay);
+                        await Task.Delay(delay, waitCts.Token);
+                    }
+                    catch (OperationCanceledException) when (!token.IsCancellationRequested)
+                    {
+                        // Woken by a cadence change: sample again right away at the new cadence.
+                    }
+                    finally
+                    {
+                        lock (_cadenceWakeLock)
+                        {
+                            _cadenceWaitCts = null;
+                        }
+                        waitCts.Dispose();
+                    }
                 }
                 catch (OperationCanceledException)
                 {
