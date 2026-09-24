@@ -30,6 +30,8 @@ namespace OmenCore.ViewModels
         private readonly UndervoltService _undervoltService;
         private readonly NotificationService _notificationService;
         private readonly PowerAutomationService? _powerAutomationService;
+        private readonly NvapiService? _nvapiService;
+        private readonly string? _productId;
 
         public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -40,7 +42,9 @@ namespace OmenCore.ViewModels
             HpWmiBios wmiBios,
             UndervoltService undervoltService,
             NotificationService? notificationService = null,
-            PowerAutomationService? powerAutomationService = null)
+            PowerAutomationService? powerAutomationService = null,
+            NvapiService? nvapiService = null,
+            string? productId = null)
         {
             _logging = logging;
             _configService = configService;
@@ -49,6 +53,8 @@ namespace OmenCore.ViewModels
             _undervoltService = undervoltService;
             _notificationService = notificationService ?? new NotificationService(_logging);
             _powerAutomationService = powerAutomationService;
+            _nvapiService = nvapiService;
+            _productId = productId;
 
             _adapterOverrideService = new AdapterPowerOverrideService(_logging);
 
@@ -585,6 +591,131 @@ namespace OmenCore.ViewModels
                                  "reboot restores stock.";
                 OnPropertyChanged(nameof(IsApuClampHeld));
             }, _ => IsApuClampHeld);
+
+        // ── The 8D87 GPU TGP unlock ──────────────────────────────────────────────────────────────
+        //
+        // A different mechanism from the adapter override above, and a different risk class.
+        // The override restarts the GPU driver so it re-reads a limit the firmware already applied;
+        // this pins two EC bits the firmware is actively reasserting and fires a WMI command while
+        // they are held, per docs/8D87-OMEN-MAX-16-SUPPORT-PLAN.md §5. NOT CONFIRMED ON REAL
+        // HARDWARE - see GpuTgpUnlockService's own remarks. Offered only on the one board it was
+        // measured on, and only when the connected adapter clears a stricter bar than the CPU clamp
+        // above uses, because a forced unlock on an undersized supply has been observed to leave the
+        // GPU degraded until reboot.
+
+        private GpuTgpUnlockService? _gpuTgpUnlockService;
+
+        private GpuTgpUnlockService? GpuTgpUnlock
+        {
+            get
+            {
+                if (_gpuTgpUnlockService != null) return _gpuTgpUnlockService;
+                if (!GpuTgpUnlockService.EcWritePathValidated) return null;
+                if (_nvapiService == null) return null;
+                if (!GpuTgpUnlockService.BoardIsSupported(_productId)) return null;
+
+                _gpuTgpUnlockService = new GpuTgpUnlockService(_logging, _wmiBios, _nvapiService);
+                return _gpuTgpUnlockService;
+            }
+        }
+
+        /// <summary>Whether this board and the connected adapter both clear the bar for this
+        /// specific unlock - independent of <see cref="CanOfferAdapterOverride"/>, which uses a
+        /// looser threshold for a lower-risk mechanism.</summary>
+        public bool CanOfferGpuTgpUnlock =>
+            GpuTgpUnlock != null
+            && _adapterInfo is HpWmiBios.AdapterInfo info
+            && GpuTgpUnlockService.SupplyMeetsSafetyBar(
+                   info, _wmiBios?.SystemDesign?.ShippingAdapterPowerRatingWatts ?? 0, out _);
+
+        /// <summary>Why the option is unavailable, for the adapter half specifically - board gating
+        /// has no user-facing reason, since it is simply not offered on any other board.</summary>
+        public string GpuTgpUnlockBlockedReason
+        {
+            get
+            {
+                if (GpuTgpUnlock == null) return string.Empty;
+                if (_adapterInfo is not HpWmiBios.AdapterInfo info) return string.Empty;
+                GpuTgpUnlockService.SupplyMeetsSafetyBar(
+                    info, _wmiBios?.SystemDesign?.ShippingAdapterPowerRatingWatts ?? 0, out var reason);
+                return reason;
+            }
+        }
+
+        public bool HasGpuTgpUnlockBlockedReason => GpuTgpUnlockBlockedReason.Length > 0;
+
+        private string _gpuTgpUnlockStatus = string.Empty;
+
+        public string GpuTgpUnlockStatus
+        {
+            get => _gpuTgpUnlockStatus;
+            private set
+            {
+                if (_gpuTgpUnlockStatus == value) return;
+                _gpuTgpUnlockStatus = value;
+                OnPropertyChanged(nameof(GpuTgpUnlockStatus));
+                OnPropertyChanged(nameof(HasGpuTgpUnlockStatus));
+            }
+        }
+
+        public bool HasGpuTgpUnlockStatus => _gpuTgpUnlockStatus.Length > 0;
+
+        private bool _gpuTgpUnlockBusy;
+
+        public bool GpuTgpUnlockBusy
+        {
+            get => _gpuTgpUnlockBusy;
+            private set
+            {
+                if (_gpuTgpUnlockBusy == value) return;
+                _gpuTgpUnlockBusy = value;
+                OnPropertyChanged(nameof(GpuTgpUnlockBusy));
+                OnPropertyChanged(nameof(CanEngageGpuTgpUnlock));
+                _engageGpuTgpUnlockCommand?.RaiseCanExecuteChanged();
+            }
+        }
+
+        public bool CanEngageGpuTgpUnlock => CanOfferGpuTgpUnlock && !GpuTgpUnlockBusy;
+
+        private AsyncRelayCommand? _engageGpuTgpUnlockCommand;
+
+        /// <summary>
+        /// Runs the unlock once. The confirmation dialog lives in the view's code-behind, same as
+        /// <see cref="ApplyAdapterOverrideCommand"/> - this command performs the action, it does not
+        /// ask for consent to it.
+        /// </summary>
+        public ICommand EngageGpuTgpUnlockCommand =>
+            _engageGpuTgpUnlockCommand ??=
+                new AsyncRelayCommand(_ => EngageGpuTgpUnlockAsync(), _ => CanEngageGpuTgpUnlock);
+
+        private async Task EngageGpuTgpUnlockAsync()
+        {
+            var service = GpuTgpUnlock;
+            if (service == null) return;
+
+            GpuTgpUnlockBusy = true;
+            GpuTgpUnlockStatus = "Pinning the firmware's power gates and asking the driver to re-read them...";
+
+            try
+            {
+                var ec = Hardware.EcAccessFactory.GetEcAccess() as Hardware.PawnIOEcAccess;
+                var adapter = _adapterInfo;
+
+                // Off the UI thread: Engage() sleeps for the design doc's measured 5 s settle time
+                // before it verifies anything, and the EC hold loop itself is a busy-wait.
+                var result = await Task.Run(() => service.Engage(_productId, ec, adapter)).ConfigureAwait(true);
+                GpuTgpUnlockStatus = result.Message;
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"GPU TGP unlock failed: {ex.Message}");
+                GpuTgpUnlockStatus = $"Failed: {ex.Message}";
+            }
+            finally
+            {
+                GpuTgpUnlockBusy = false;
+            }
+        }
 
         /// <summary>True when the override can actually be attempted right now.</summary>
         public bool CanApplyAdapterOverride =>

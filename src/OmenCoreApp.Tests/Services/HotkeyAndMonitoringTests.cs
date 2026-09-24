@@ -451,8 +451,67 @@ namespace OmenCoreApp.Tests.Services
                 "two consecutive idle readings is not yet enough to back off further");
 
             InvokeUpdateGpuIdleTracking(svc, IdleGpuSample);
-            InvokeGetEffectiveCadenceInterval(svc).Should().Be(TimeSpan.FromMinutes(2),
+            InvokeGetEffectiveCadenceInterval(svc).Should().Be(HardwareMonitoringService.GpuDeepIdleCadence,
                 "three consecutive confirmed-idle GPU readings should trigger the deep-idle cadence");
+        }
+
+        private static (HardwareMonitoringService svc, System.Threading.CancellationTokenSource waiting) ServiceWithRegisteredSleep()
+        {
+            var logging = new LoggingService();
+            logging.Initialize();
+            var svc = new HardwareMonitoringService(new LibreHardwareMonitorBridge(), logging,
+                new MonitoringPreferences { LowOverheadMode = false }, new ResumeRecoveryDiagnosticsService());
+
+            // Stand in for the monitor loop's in-progress inter-sample sleep.
+            var cts = new System.Threading.CancellationTokenSource();
+            typeof(HardwareMonitoringService)
+                .GetField("_cadenceWaitCts", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                .SetValue(svc, cts);
+            return (svc, cts);
+        }
+
+        [Fact]
+        public void CadenceAffectingModeChanges_CutTheMonitorLoopsCurrentSleepShort()
+        {
+            // v4.3.1 regression (field reports on 8A25/8BD4): the loop slept out its whole cadence
+            // before noticing a change, so with a 2-minute deep-idle sleep, opening the window or
+            // showing the OSD left stale/zero numbers for minutes. Every cadence-affecting setter
+            // must wake the loop.
+            foreach (var change in new System.Action<HardwareMonitoringService>[]
+            {
+                s => s.SetUiWindowActive(false),   // default is active, so this is a real change
+                s => s.SetTrayOnlyMode(true),
+                s => s.SetOverlayRealtimeMode(true),
+                s => s.SetLowOverheadMode(true),
+            })
+            {
+                var (svc, waiting) = ServiceWithRegisteredSleep();
+                change(svc);
+                waiting.IsCancellationRequested.Should().BeTrue("a real mode change must end the current sleep so the new cadence applies immediately");
+            }
+        }
+
+        [Fact]
+        public void RedundantModeSets_DoNotWakeTheLoop()
+        {
+            var (svc, waiting) = ServiceWithRegisteredSleep();
+
+            svc.SetUiWindowActive(true);          // already true
+            svc.SetTrayOnlyMode(false);           // already false
+            svc.SetOverlayRealtimeMode(false);    // already false
+
+            waiting.IsCancellationRequested.Should().BeFalse("setting a mode to its current value must not cause extra sampling");
+        }
+
+        [Fact]
+        public void DeepIdleCadence_StaysWellUnderTheWatchdogFreezeThreshold()
+        {
+            // v4.3.1 regression (GitHub #203, board 8BD4 bundles): a 2-minute deep-idle cadence
+            // outlasted the watchdog's 90s freeze limit, so every tray-only idle stretch was read
+            // as "temperature monitoring frozen" and real fans were forced to 90% about every two
+            // minutes. Require at least a 2x margin so one late tick can never trip it.
+            (HardwareMonitoringService.GpuDeepIdleCadence.TotalSeconds * 2)
+                .Should().BeLessThan(HardwareWatchdogService.FreezeThresholdSeconds);
         }
 
         [Fact]
@@ -494,7 +553,7 @@ namespace OmenCoreApp.Tests.Services
             InvokeUpdateGpuIdleTracking(svc, IdleGpuSample);
             InvokeUpdateGpuIdleTracking(svc, IdleGpuSample);
             InvokeUpdateGpuIdleTracking(svc, IdleGpuSample);
-            InvokeGetEffectiveCadenceInterval(svc).Should().Be(TimeSpan.FromMinutes(2));
+            InvokeGetEffectiveCadenceInterval(svc).Should().Be(HardwareMonitoringService.GpuDeepIdleCadence);
 
             InvokeUpdateGpuIdleTracking(svc, BusyGpuSample);
 

@@ -334,6 +334,19 @@ namespace OmenCoreApp.Tests.Hardware
             caps.SupportsUndervolt.Should().BeFalse();
         }
 
+        [Fact]
+        public void GetCapabilities_8E35_AllowsDecoupledWmiThermalPolicyFallback()
+        {
+            // GitHub #195 ran a controlled Quiet-vs-Performance test showing a 0.0 W CPU package
+            // power difference, with the Apply Trace confirming Direct EC writes are disabled and
+            // the WMI thermal-policy fallback was never attempted - Performance mode changed
+            // nothing on this board. Enabling this flag gives it the same fallback path 88EC/8CC0
+            // already have for the same "EC disabled, no fallback" shape.
+            var caps = ModelCapabilityDatabase.GetCapabilities("8E35");
+
+            caps.AllowDecoupledWmiThermalPolicyFallback.Should().BeTrue();
+        }
+
         // GitHub #130/#171: was resolving via OMEN17 family fallback ("Model not in database").
         // MaxFanLevel is pinned at 45 (not the sibling boards' nominal 55) because #171's own
         // Guided Fan Verification measured this exact board's real Max-hold ceiling at 45 -
@@ -453,6 +466,37 @@ namespace OmenCoreApp.Tests.Hardware
             caps.AllowDecoupledWmiThermalPolicyFallback.Should().BeTrue();
             caps.UserVerified.Should().BeFalse();
             caps.Notes.Should().Contain("#197");
+        }
+
+        [Fact]
+        public void GetCapabilities_8CC0_Omen16Ae0xxx_ResolvesExactlyAndStaysConservative()
+        {
+            // GitHub #204: previously OMEN16 family fallback, where Performance mode applied nothing.
+            var caps = ModelCapabilityDatabase.GetPreferredCapabilities("8CC0", "OMEN Gaming Laptop 16-ae0xxx");
+
+            caps.Should().NotBeNull();
+            caps!.ProductId.Should().Be("8CC0");
+            caps.SupportsFanControlWmi.Should().BeTrue();
+            caps.SupportsFanControlEc.Should().BeFalse();
+            caps.AllowDecoupledWmiThermalPolicyFallback.Should().BeTrue("Performance must not be a no-op when direct EC writes are unavailable");
+            caps.SupportsFanCurves.Should().BeFalse("no evidence yet that curves work on this board");
+            caps.SupportsGpuPowerBoost.Should().BeFalse();
+            caps.UserVerified.Should().BeFalse();
+            caps.Notes.Should().Contain("#204");
+        }
+
+        [Fact]
+        public void GetCapabilities_8DD0_VictusFb3xxx_ResolvesExactly_WithFanControlKept()
+        {
+            // PR #200: this board hit the v4.3.1 fan-control regression. The exact entry must keep
+            // WMI fan control on and win over the shared 15-fb3 pattern entry.
+            var caps = ModelCapabilityDatabase.GetPreferredCapabilities("8DD0", "Victus by HP Gaming Laptop 15-fb3xxx");
+
+            caps.Should().NotBeNull();
+            caps!.ProductId.Should().Be("8DD0");
+            caps.SupportsFanControlWmi.Should().BeTrue();
+            caps.SupportsFanCurves.Should().BeTrue();
+            caps.UserVerified.Should().BeFalse("one contributor's run is not the full verification card");
         }
 
         [Fact]
@@ -590,6 +634,19 @@ namespace OmenCoreApp.Tests.Hardware
             ModelCapabilityDatabase.IsAmbiguousProductId("8BB1").Should().BeTrue();
         }
 
+        [Fact]
+        public void GetPreferredCapabilities_Ambiguous8Bb1_DoesNotClaimASpecificYear()
+        {
+            // GitHub #202: the entry used to say "(2022)" unconditionally, which was simply wrong
+            // for a reporter's confirmed 2024 fa1082wm unit - the 15-fa1 name pattern spans more
+            // than one year and cannot tell them apart, so it should not assert one.
+            var caps = ModelCapabilityDatabase.GetPreferredCapabilities("8BB1", "Victus by HP Gaming Laptop 15-fa1xxx");
+
+            caps.Should().NotBeNull();
+            caps!.ModelName.Should().NotContain("(2022)");
+            caps.ModelName.Should().NotContain("(2024)");
+        }
+
         /// <summary>
         /// GitHub #163 / Discord (Trirez): HP OMEN 16 XF0079AX, Ryzen 7 7840HS + RTX 4070,
         /// resolved to the Intel wf0xxx 8BCA entry via exact ProductId - same board/ProductId
@@ -673,6 +730,24 @@ namespace OmenCoreApp.Tests.Hardware
             caps.Should().NotBeNull();
             caps!.AllowDecoupledWmiThermalPolicyFallback.Should().BeTrue(
                 "Direct EC writes are disabled on this board, so performance mode switches need the WMI thermal-policy fallback to have any effect at all");
+        }
+
+        [Fact]
+        public void GetPreferredCapabilities_88ED_ResolvesExactly_WithFanControlAndFallbackKept()
+        {
+            var caps = ModelCapabilityDatabase.GetPreferredCapabilities("88ED", "Victus by HP Laptop 16-e0xxx");
+
+            caps.Should().NotBeNull();
+            caps!.ProductId.Should().Be("88ED", "GitHub #209 reports Baseboard ProductId 88ED");
+            caps.ModelNamePattern.Should().Be("16-e0");
+            caps.Family.Should().Be(OmenModelFamily.Victus);
+            caps.SupportsFanControlWmi.Should().BeTrue();
+            caps.SupportsFanCurves.Should().BeTrue();
+            caps.HasFourZoneRgb.Should().BeFalse("conservative until 88ED's own RGB hardware is field-verified");
+            caps.AllowDecoupledWmiThermalPolicyFallback.Should().BeTrue(
+                "sibling 88EC needed this for Performance-mode switching to do anything, since Direct EC writes are disabled on this family");
+            caps.UserVerified.Should().BeFalse("a support request with no diagnostics bundle isn't a field verification");
+            caps.Notes.Should().Contain("GitHub #209");
         }
 
         [Fact]

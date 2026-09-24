@@ -86,5 +86,21 @@ namespace OmenCoreApp.Tests.ViewModels
 
             result.Should().NotEndWith("\n");
         }
+
+        [Fact]
+        public async System.Threading.Tasks.Task RestoreDefaultSettings_WithoutAUiDispatcher_LogsAndReturns_InsteadOfThrowingOffThread()
+        {
+            // GitHub #206: the restore path used to mutate WPF-bound properties directly from the
+            // game-profile monitor thread. With no dispatcher available (as in this headless test
+            // process) it must now bail out cleanly rather than touch UI-bound state at all.
+            using var vm = new MainViewModel();
+            var method = typeof(MainViewModel).GetMethod("RestoreDefaultSettingsAsync",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            method.Should().NotBeNull();
+
+            var act = async () => await (System.Threading.Tasks.Task)method!.Invoke(vm, null)!;
+
+            await act.Should().NotThrowAsync();
+        }
     }
 }

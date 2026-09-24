@@ -22,6 +22,24 @@ improvement.
 **Base Version:** v4.3.0
 **Tracking doc:** `docs/ROADMAP_v4.3.1.md` — full investigation detail, rejected options, and evidence trails live there; this file stays short.
 
+### Erratum — Changes in This Release Were Wrong (Fixed on `main`, Not Yet Released)
+
+Found from field bundles after release ([#203](https://github.com/theantipopau/omencore/issues/203),
+[#202](https://github.com/theantipopau/omencore/issues/202)); details in `docs/CHANGELOG_v4.4.0.md`.
+
+- **"Unverified Boards No Longer Assume Fan Control Works When Firmware Says It Doesn't"** (below) is
+  wrong. HP's `SystemDesignData` software-fan-control bit reads false on V0-thermal-policy firmware
+  where fans demonstrably respond, so this disabled working fan control and Custom Fan Curve on
+  boards such as `8C2F` and `8BB1`. **Workaround on 4.3.1:** none in the UI; affected users can
+  stay on 4.3.0 until the next release.
+- **"GPU Telemetry Backs Off Further Once Confirmed Idle"** (below) shipped a 2-minute cadence that
+  is longer than the hardware watchdog's 90-second "monitoring frozen" limit, so tray-only idle
+  periods triggered a false watchdog failsafe that set fans to 90% roughly every two minutes.
+  The long sleep also couldn't be interrupted, so opening the window or showing the OSD left stale or
+  zero fan/CPU/GPU numbers for up to that long.
+  **Workaround on 4.3.1:** keep the OmenCore window open (the backoff only applies while the window is
+  hidden/tray-only), or stay on 4.3.0.
+
 ### Downloads
 
 Computed by the release workflow itself from the exact files attached to the

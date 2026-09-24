@@ -2337,8 +2337,17 @@
                                         Visibility="{Binding OghInstalled, Converter={StaticResource BoolToVisibility}}">
                                     <StackPanel Orientation="Horizontal">
                                         <TextBlock Text="⚠️" FontSize="14" Margin="0,0,8,0" VerticalAlignment="Center"/>
-                                        <TextBlock Text="OMEN Gaming Hub is still installed! The OMEN key will open OGH instead of OmenCore. Use Bloatware Manager to remove OGH." 
-                                                   FontSize="11" Foreground="{StaticResource WarningBrush}" TextWrapping="Wrap"/>
+                                        <StackPanel>
+                                            <!-- GitHub #199: HPOmenCap can stay running as a leftover driver-support
+                                                 service after OMEN Gaming Hub itself is uninstalled, and the OMEN key
+                                                 still opened OmenCore on that machine - the old text's specific
+                                                 prediction ("will open OGH instead") was wrong for that case. Says
+                                                 what was actually detected instead of asserting the consequence. -->
+                                            <TextBlock Text="An OMEN Gaming Hub service or process is running. This can conflict with OmenCore's fan control, undervolt, or OMEN key handling. If Gaming Hub itself is still installed, use Bloatware Manager to remove it."
+                                                       FontSize="11" Foreground="{StaticResource WarningBrush}" TextWrapping="Wrap"/>
+                                            <TextBlock Text="{Binding OghDetectionDetail}" FontSize="10"
+                                                       Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap" Margin="0,4,0,0"/>
+                                        </StackPanel>
                                     </StackPanel>
                                 </Border>
                                 

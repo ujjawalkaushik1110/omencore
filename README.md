@@ -57,6 +57,7 @@ It runs without ads, account prompts, cloud telemetry, or OMEN Gaming Hub. Hardw
 **Version:** 4.3.1<br>
 **Released:** 2026-09-15<br>
 **Status:** Test-verified (1455/1455 tests, 0 build warnings). Patch release that grew into a broader maintenance cycle: a real, provable config-persistence data-loss bug, a broken auto-updater SHA256 check (and the release-process bug behind it), an OMEN-key WMI event bug, two `MainViewModel`/`SystemControlViewModel` decomposition passes, three board database entries, and two rounds of cross-project review against a similar tool ("Ohman"). Every fan/EC/thermal/OC/UV-behavior change has field validation except one, stated honestly rather than glossed over: the OMEN-key fix (`#193`) is root-caused with strong evidence but not yet reconfirmed by the reporter on their board (`8D2F`) as of release.<br>
+**Known issues in 4.3.1:** two of this release's changes are wrong and are fixed on `main` for the next release — the firmware "software fan control" bit disabled working fan control on some V0-firmware boards (e.g. `8C2F`, `8BB1`), and the 2-minute GPU-idle cadence tripped the hardware watchdog's false "monitoring frozen" 90% fan failsafe while the window is hidden. See the [erratum](docs/CHANGELOG_v4.3.1.md) for workarounds.<br>
 **Release notes:** [docs/CHANGELOG_v4.3.1.md](docs/CHANGELOG_v4.3.1.md)<br>
 **Roadmap:** [docs/ROADMAP_v4.3.1.md](docs/ROADMAP_v4.3.1.md)
 

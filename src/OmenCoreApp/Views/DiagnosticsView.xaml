@@ -250,6 +250,33 @@
 
                     <TextBlock Text="Read from the BIOS each time this tab is opened. This is the machine's own view of the supply attached to it, not a measurement."
                                FontSize="11" Foreground="{StaticResource TextTertiaryBrush}" TextWrapping="Wrap" Margin="0,10,0,0"/>
+
+                    <!-- The board-8D87-only GPU TGP unlock. A different, higher-risk mechanism from
+                         the adapter override above (EC bits the firmware actively reasserts, not a
+                         driver restart), so it gets its own, more explicit risk block rather than
+                         living inside the section above it. Not confirmed on real hardware. -->
+                    <StackPanel Margin="0,16,0,0"
+                                Visibility="{Binding GpuClamp.CanOfferGpuTgpUnlock, Converter={StaticResource BoolToVisibility}}">
+                        <Separator Margin="0,0,0,10"/>
+                        <TextBlock Text="GPU power unlock (experimental, board 8D87 only)" FontSize="12" FontWeight="SemiBold"
+                                   Foreground="{StaticResource WarningBrush}"/>
+                        <TextBlock TextWrapping="Wrap" FontSize="11" Margin="0,4,0,0"
+                                   Foreground="{StaticResource TextSecondaryBrush}"
+                                   Text="This board's GPU is held under its full 175 W rating by two firmware gates that OMEN Gaming Hub normally holds open. This pins them open for one moment and asks the driver to re-read them - not an overclock, and not persistent: the firmware takes both gates back on the next resume, adapter change, or reboot."/>
+                        <TextBlock TextWrapping="Wrap" FontSize="11" Margin="0,6,0,0"
+                                   Foreground="{StaticResource WarningBrush}" FontWeight="SemiBold"
+                                   Text="Not confirmed on real hardware. Forcing this on an undersized power adapter has been observed, during the investigation this is built from, to leave the GPU in a degraded state that only cleared after a reboot - on a machine with a history of GPU-driver crashes. This is why it only offers itself on an adapter well above this machine's rated requirement."/>
+                        <TextBlock Text="{Binding GpuClamp.GpuTgpUnlockStatus}" FontSize="11" Margin="0,8,0,0"
+                                   Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap"
+                                   Visibility="{Binding GpuClamp.HasGpuTgpUnlockStatus, Converter={StaticResource BoolToVisibility}}"/>
+                        <Button Content="Try the GPU power unlock"
+                                Click="EngageGpuTgpUnlock_Click"
+                                IsEnabled="{Binding GpuClamp.CanEngageGpuTgpUnlock}"
+                                Style="{StaticResource OutlineButtonSmall}" Margin="0,10,0,0"
+                                HorizontalAlignment="Left"
+                                ToolTip="Experimental. Pins two EC bits and fires one WMI command, then verifies by measured GPU power. Not confirmed on real hardware - see the text above."
+                                AutomationProperties.Name="Try the GPU power unlock (experimental)"/>
+                    </StackPanel>
                 </StackPanel>
             </GroupBox>
 

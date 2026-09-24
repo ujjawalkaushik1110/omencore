@@ -151,6 +151,59 @@ namespace OmenCoreApp.Tests.Hardware
         }
 
         [Fact]
+        public void StrixHalo_SharesStrixPointMailbox_NotPhoenixMailbox()
+        {
+            // nb_smu_ops.c selects MP1 address set 3 for FAM_KRACKANPOINT, FAM_STRIXPOINT and
+            // FAM_STRIXHALO in one case group; UXTU's Socket_FT6_FP7_FP8 branches the same three
+            // (plus Krackan) onto 0x3b10928/0x3b10978. Strix Halo was in the Phoenix set-2 arm
+            // here, which sends every MP1 message on a Ryzen AI MAX to the wrong registers.
+            var smu = new RyzenSmu();
+            try
+            {
+                ConfigureFor(smu, RyzenFamily.StrixHalo);
+
+                smu.Mp1AddrMsg.Should().Be(0x3B10928, "MP1_C2PMSG_MESSAGE_ADDR_3");
+                smu.Mp1AddrRsp.Should().Be(0x3B10978, "MP1_C2PMSG_RESPONSE_ADDR_3");
+                smu.Mp1AddrArg.Should().Be(0x3B10998, "MP1_C2PMSG_ARG_BASE_3");
+
+                // PSMU set 1, the default arm - only Dragon Range and Fire Range differ.
+                smu.PsmuAddrMsg.Should().Be(0x3B10A20);
+                smu.PsmuAddrRsp.Should().Be(0x3B10A80);
+                smu.PsmuAddrArg.Should().Be(0x3B10A88);
+            }
+            finally
+            {
+                smu.Dispose();
+            }
+        }
+
+        [Fact]
+        public void DragonRangeAndFireRange_UseTheirOwnMailbox()
+        {
+            // MP1 address set 4 and PSMU address set 2 - the only families that move the PSMU
+            // mailbox off set 1. Pinned because the two sets differ by a few bytes and a copy from
+            // the neighbouring arm would look right.
+            foreach (var family in new[] { RyzenFamily.RaphaelDragonRange, RyzenFamily.FireRange })
+            {
+                var smu = new RyzenSmu();
+                try
+                {
+                    ConfigureFor(smu, family);
+
+                    smu.Mp1AddrMsg.Should().Be(0x3B10530, "MP1_C2PMSG_MESSAGE_ADDR_4");
+                    smu.Mp1AddrRsp.Should().Be(0x3B1057C, "MP1_C2PMSG_RESPONSE_ADDR_4");
+                    smu.Mp1AddrArg.Should().Be(0x3B109C4, "MP1_C2PMSG_ARG_BASE_4");
+                    smu.PsmuAddrMsg.Should().Be(0x3B10524, "PSMU_C2PMSG_MESSAGE_ADDR_2");
+                    smu.PsmuAddrRsp.Should().Be(0x3B10570, "PSMU_C2PMSG_RESPONSE_ADDR_2");
+                }
+                finally
+                {
+                    smu.Dispose();
+                }
+            }
+        }
+
+        [Fact]
         public void UnavailableReason_IsPopulated_BeforeInitialize()
         {
             // A user-facing block reason must never be empty while the backend is unavailable,
@@ -297,6 +350,42 @@ namespace OmenCoreApp.Tests.Hardware
             }
 
             return null;
+        }
+
+        [Theory]
+        [InlineData("AMD RYZEN AI MAX+ 395 w/ Radeon 8060S", RyzenFamily.StrixHalo)]
+        [InlineData("AMD Ryzen 9 7945HX with Radeon Graphics", RyzenFamily.RaphaelDragonRange)]
+        [InlineData("AMD Ryzen 7 7845HX with Radeon Graphics", RyzenFamily.RaphaelDragonRange)]
+        public void IgpuSlider_IsNotOffered_WhereEveryWriteWouldBeRefused(string cpuName, RyzenFamily family)
+        {
+            // These names are on the iGPU CO allowlist, but SetIgpuCO has no cited message for their
+            // family and returns UnknownCmd - so showing the slider would offer a control that
+            // cannot move. The gate is the intersection of both lists.
+            RyzenControl.IsOnIgpuUndervoltNameAllowlist(cpuName).Should().BeTrue();
+            AmdUndervoltProvider.FamilySupportsIgpuCurveOptimizer(family).Should().BeFalse(
+                "otherwise SupportsIgpuUndervolt would still show the slider on this part");
+        }
+
+        [Fact]
+        public void IgpuSkipReason_ForAnUpstreamMappedFamily_DoesNotClaimThereIsNoMessage()
+        {
+            // v4.3.0's review of PR #176: Phoenix/Hawk Point owners were told there is "no confirmed
+            // iGPU CO message" for their CPU, when upstream RyzenAdj maps PSMU 0xB7 for both. The
+            // honest reason is that OmenCore has not enabled it yet.
+            var reason = AmdUndervoltProvider.DescribeIgpuSkip(
+                "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics", RyzenFamily.HawkPoint);
+
+            reason.Should().Contain("not validated");
+            reason.Should().NotContain("no confirmed");
+        }
+
+        [Fact]
+        public void IgpuSkipReason_ForAnUnmappedFamily_SaysThereIsNoMessage()
+        {
+            var reason = AmdUndervoltProvider.DescribeIgpuSkip(
+                "AMD Ryzen AI 9 HX 375 w/ Radeon 890M", RyzenFamily.StrixPoint);
+
+            reason.Should().Contain("no confirmed");
         }
     }
 }

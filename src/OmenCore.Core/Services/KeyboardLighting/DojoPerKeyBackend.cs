@@ -23,14 +23,22 @@ namespace OmenCore.Services.KeyboardLighting
     ///                                         0x05/0x06/0x07, 176-entry key map) and the twelve
     ///                                         device ANIMATIONS (command 0x03). The MCU holds the
     ///                                         map, draws it, and restores it after the Fn overlay.
-    ///   mi_04, <see cref="HidLampArray"/>     HID LampArray, per-key addressed by lamp id. Used
-    ///                                         for the per-key editor's individual key painting.
-    ///                                         Requires host ownership, which means the MCU stops
-    ///                                         drawing — and cannot restore after Fn.
+    ///   mi_04, <see cref="HidLampArray"/>     HID LampArray, per-key addressed by lamp id, with a
+    ///                                         per-lamp intensity channel. Requires host ownership,
+    ///                                         which means the MCU stops drawing — and cannot
+    ///                                         restore after Fn.
     ///
-    /// Uniform and zone colour go through mi_03, so the MCU owns the picture and the Fn key works.
-    /// Per-key painting (the editor) goes through mi_04 for individual addressing, with an mi_03
-    /// base layer as a fallback the MCU can restore to after Fn.
+    /// ALL colour goes through mi_03 whenever the board's layout is known, uniform and per-key
+    /// alike, so the MCU owns the picture and the Fn key works. mi_04 is the fallback for a board
+    /// whose lamp ids cannot be turned into colour-map positions, and that path cannot survive Fn.
+    /// It is also used, as a documented and admin-free retry, when the MCU accepts the connection
+    /// but refuses a specific mi_03 write at runtime — see the comment in
+    /// <see cref="SetZoneColorsAsync"/> on that trigger; it is NOT hardware-confirmed the way the
+    /// rest of this class is (see the class-level remark on that path).
+    ///
+    /// BRIGHTNESS IS ARITHMETIC HERE, not a device setting. mi_04 has an intensity channel and
+    /// mi_03 has none, so the colour map is scaled on the host on its way to the wire — see
+    /// <see cref="Scale"/>. The MCU's own brightness command is refused by this firmware.
     ///
     /// Effects can be read back off the MCU and are checked here. Colours cannot - the LampArray
     /// spec has no colour readback - so "did that key turn red" has no software answer, and the
@@ -38,6 +46,12 @@ namespace OmenCore.Services.KeyboardLighting
     ///
     /// Board scope: measured on 8D87 (OMEN MAX 16-ak0xxx, BIOS F.07, EC 40.38). Protocol map and
     /// evidence: omen-max-16/reference/keyboard-mcu.md.
+    ///
+    /// One path in this class is NOT part of that evidence set: the mi_03-refusal-on-a-mapped-board
+    /// retry in <see cref="SetZoneColorsAsync"/>'s uniform-fill branch is a response to a single
+    /// field report (RGB working, then a cold boot leaving only the light bar responsive) and has
+    /// not been reproduced or measured on hardware. It is a different trigger from the documented
+    /// mi_04 fallback above (an unresolvable board layout) and is called out separately below.
     /// </summary>
     public sealed class DojoPerKeyBackend : IKeyboardBackend
     {
@@ -60,6 +74,33 @@ namespace OmenCore.Services.KeyboardLighting
         private byte _brightness = 255;
         private bool _hostOwnsLamps;
         private bool _disposed;
+
+        /// <summary>
+        /// The last colour map handed to the MCU, UNSCALED — as the caller painted it, not as it
+        /// went out on the wire. Brightness re-sends this at a new setting, which it can only do
+        /// if what is remembered is the picture rather than the last dimmed copy of it; keeping
+        /// the scaled bytes would make each brightness change compound on the previous one.
+        /// </summary>
+        private byte[]? _mapR, _mapG, _mapB;
+
+        /// <summary>
+        /// Whether <see cref="_mapR"/> is the MCU's current base picture - what it draws whenever
+        /// the backlight is lit. False once an effect or host lamp ownership has taken the display,
+        /// and it is what stops a brightness change from yanking a running animation back to a
+        /// stale static frame. Deliberately NOT cleared by a blank: see <see cref="_backlightBlanked"/>.
+        /// </summary>
+        private bool _mcuShowsHostMap;
+
+        /// <summary>
+        /// Whether the backlight is currently off via the MCU's own blank.
+        ///
+        /// Kept separate from <see cref="_mcuShowsHostMap"/> on purpose. They used to be one flag,
+        /// and turning the backlight back on had to reconstruct "was the map showing" from
+        /// <c>_mapR != null</c> - which only says a map was EVER painted. Paint, apply a device
+        /// effect, blank, unblank: that guess said "map", the next brightness change re-sent it,
+        /// and the running effect froze into a stale still. Flagged in the v4.3.0 review of PR #176.
+        /// </summary>
+        private bool _backlightBlanked;
 
         private const int ZoneCountConst = 4;
 
@@ -98,6 +139,22 @@ namespace OmenCore.Services.KeyboardLighting
         public string DeviceIdentity => _mcu == null
             ? "no MCU"
             : $"{_mcu.VendorId:X4}:{_mcu.ProductId:X4}";
+
+        /// <summary>
+        /// What Windows Dynamic Lighting is set to do with this keyboard, or null when there is no
+        /// MCU to identify.
+        ///
+        /// Read live rather than cached: it is a user setting on a Settings page they may well be
+        /// visiting BECAUSE we just told them to, so a value captured at startup would be stale at
+        /// the one moment it matters. The read is two registry keys and does not touch the device.
+        ///
+        /// The MCU's VID/PID identify the whole keyboard, and Dynamic Lighting's device card is
+        /// filed against the LampArray interface of that same physical device - mi_04 rather than
+        /// the mi_03 this backend commands - so one identity finds both.
+        /// </summary>
+        public DynamicLightingState? DynamicLighting => _mcu == null
+            ? null
+            : DynamicLightingState.Read(_mcu.VendorId, _mcu.ProductId);
 
         public Task<bool> InitializeAsync()
         {
@@ -153,11 +210,30 @@ namespace OmenCore.Services.KeyboardLighting
                 {
                     // MI_03: the MCU holds the colour map and redraws after the Fn overlay.
                     // No host control needed — the device is autonomous and draws its own picture.
-                    ReleaseHostControlIfHeld();
                     var c = normalized[0];
-                    result.BackendReportedSuccess = _mcu.SetStaticColor(c.R, c.G, c.B);
+                    result.BackendReportedSuccess = WriteUniformColorMap(c);
                     _logging.Info($"[DojoPerKey] Uniform fill via mi_03: " +
                                   $"{(result.BackendReportedSuccess ? "accepted" : "REFUSED")}");
+
+                    // UNCONFIRMED ON HARDWARE (unlike the rest of this class) - see the class-level
+                    // remark above. Field report (8D87, v4.3.1 log): after a full shutdown the MCU
+                    // refused the mi_03 fill, and with nothing else tried the whole apply failed -
+                    // the V2 engine then fell back to the four-zone WMI ColorTable, which on this
+                    // chassis only drives the light bar, so the keyboard silently stopped changing
+                    // while the light bar kept working. mi_04 (HID LampArray) is a documented,
+                    // admin-free way to paint the same keys, so try it before giving up. Trade-off
+                    // stated in the branch below: host control means the picture won't be redrawn
+                    // by the MCU after an Fn overlay. Only reached when the preferred path already
+                    // failed, so the working (measured) path above is unchanged.
+                    if (!result.BackendReportedSuccess && _lamps != null && _lampMap.Count > 0)
+                    {
+                        TakeHostControl();
+                        ushort first = _lampMap.Min(l => l.LampId);
+                        ushort last = _lampMap.Max(l => l.LampId);
+                        result.BackendReportedSuccess = _lamps.SetRange(first, last, c.R, c.G, c.B, _brightness);
+                        _logging.Info($"[DojoPerKey] Uniform fill over lamps {first}-{last} (mi_04, after mi_03 refusal): " +
+                                      $"{(result.BackendReportedSuccess ? "accepted" : "REFUSED")}");
+                    }
                 }
                 else if (uniform && _lamps != null && _lampMap.Count > 0)
                 {
@@ -186,7 +262,7 @@ namespace OmenCore.Services.KeyboardLighting
                 {
                     // No layout for this board, so lamp ids cannot become colour-map positions.
                     // Uniform mi_03 base as the Fn fallback, per-zone picture on mi_04 above it.
-                    _mcu?.SetStaticColor(normalized[0].R, normalized[0].G, normalized[0].B);
+                    if (_mcu != null) WriteUniformColorMap(normalized[0], release: false);
                     TakeHostControl();
 
                     var lamps = new List<HidLampArray.LampColor>(_lampMap.Count);
@@ -247,15 +323,19 @@ namespace OmenCore.Services.KeyboardLighting
         public Task<Color[]?> ReadZoneColorsAsync() => Task.FromResult<Color[]?>(null);
 
         /// <summary>
-        /// Set brightness, which on this keyboard means the LampArray intensity channel and only that.
+        /// Set brightness, which on this keyboard means re-scaling the host-painted picture and
+        /// only that.
         ///
         /// MCU command 0x0C IS STILL SENT, and is expected to fail: measured on 8D87 it is refused at
         /// every payload value while every other command in this class is acknowledged through the
         /// same path. It costs one frame and would be the right lever on a board that implements it.
         ///
-        /// The gap that leaves is real. Intensity scales a HOST-PAINTED picture, and a device-rendered
-        /// effect is drawn by the MCU with no host involvement - so nothing here dims a running
-        /// effect, and a UI implying otherwise would be lying.
+        /// So the picture is re-sent instead, dimmed. Which picture depends on who is drawing:
+        /// the mi_03 colour map when the MCU holds one, the mi_04 lamps when the host took them.
+        ///
+        /// The gap that leaves is real. Both are HOST-PAINTED pictures, and a device-rendered effect
+        /// is drawn by the MCU from its own state with no host involvement - so nothing here dims a
+        /// running effect, and a UI implying otherwise would be lying.
         /// </summary>
         public async Task<bool> SetBrightnessAsync(int brightness)
         {
@@ -263,33 +343,52 @@ namespace OmenCore.Services.KeyboardLighting
             _brightness = (byte)(clamped * 255 / 100);
 
             bool mcuTook = _mcu?.SetBrightness((byte)clamped) ?? false;
-            bool lampsTook = false;
+            bool repainted = false;
 
             // Repaint ONLY when the host is already displaying a picture. Repainting
-            // unconditionally would take the lamps away from a running device effect and freeze it
-            // into a static frame - so asking to dim an animation would silently stop it, which is
-            // not what anyone means by a brightness change.
-            if (_hostOwnsLamps && _lamps != null && _lampMap.Count > 0)
+            // unconditionally would take the display away from a running device effect and freeze
+            // it into a static frame - so asking to dim an animation would silently stop it, which
+            // is not what anyone means by a brightness change.
+            if (ShouldRepaintMapForBrightness(_mcuShowsHostMap, _backlightBlanked, _mapR != null) &&
+                _mapR != null && _mapG != null && _mapB != null)
+            {
+                repainted = WriteColorMap(_mapR, _mapG, _mapB);
+            }
+            else if (_hostOwnsLamps && _lamps != null && _lampMap.Count > 0)
             {
                 var repaint = await SetZoneColorsAsync(_lastZoneColors);
-                lampsTook = repaint.BackendReportedSuccess;
+                repainted = repaint.BackendReportedSuccess;
             }
 
             if (mcuTook)
                 _logging.Info($"[DojoPerKey] MCU accepted brightness {clamped} via 0x0C - unexpected on 8D87, worth reporting");
-            else if (!lampsTook)
+            else if (repainted)
+                _logging.Info($"[DojoPerKey] Brightness {clamped} applied by re-scaling the displayed picture");
+            else
                 _logging.Info("[DojoPerKey] Brightness had nowhere to land: the MCU refused 0x0C and no " +
                               "host-painted picture was displayed to re-scale. A running device effect " +
                               "cannot be dimmed on this hardware.");
 
-            return mcuTook || lampsTook;
+            return mcuTook || repainted;
         }
 
         public Task<bool> SetBacklightEnabledAsync(bool enabled)
         {
             // The MCU's own blank is the right lever: it leaves the installed effect in place, so
             // turning the backlight back on restores what was there rather than a black keyboard.
-            if (_mcu != null) return Task.FromResult(_mcu.SetLightingEnabled(enabled));
+            if (_mcu != null)
+            {
+                bool toggled = _mcu.SetLightingEnabled(enabled);
+
+                // A blanked keyboard is not displaying the map even though the MCU still holds it.
+                // Without this a brightness change would re-send the map - and the colour write
+                // carries command 0x09 payload 0x01, so it would turn the backlight back on.
+                // Only the blank flag moves here; whether the map or an effect is the base picture
+                // is unchanged by a blank, so unblanking needs no guess about it.
+                if (toggled) _backlightBlanked = !enabled;
+
+                return Task.FromResult(toggled);
+            }
 
             if (_lamps == null) return Task.FromResult(false);
 
@@ -385,7 +484,10 @@ namespace OmenCore.Services.KeyboardLighting
         public bool SetMcuBrightnessOnly(byte level) => _mcu?.SetBrightness(level) ?? false;
 
         /// <summary>
-        /// Set the intensity attached to each lamp in subsequent colour writes. Does not repaint.
+        /// Set the brightness applied to subsequent colour writes on BOTH interfaces - the mi_04
+        /// intensity channel, and the host-side scaling of the mi_03 colour map. Does not repaint,
+        /// which is the whole point: the per-key editor calls this and then writes a full picture,
+        /// and a repaint here would send the map twice for one Apply.
         /// </summary>
         public void SetLampIntensity(int brightness) =>
             _brightness = (byte)(Math.Clamp(brightness, 0, 100) * 255 / 100);
@@ -495,10 +597,87 @@ namespace OmenCore.Services.KeyboardLighting
                 b[position] = color.B;
             }
 
+            return WriteColorMap(r, g, b);
+        }
+
+        /// <summary>
+        /// Whether a brightness change may re-send the retained colour map: only when that map is
+        /// the MCU's base picture, a map exists, and the backlight is lit. A blanked keyboard must
+        /// stay dark (the colour frame would light it), and a device effect must keep running.
+        /// </summary>
+        internal static bool ShouldRepaintMapForBrightness(bool mapIsBasePicture, bool backlightBlanked, bool mapExists) =>
+            mapIsBasePicture && !backlightBlanked && mapExists;
+
+        /// <summary>
+        /// Scale one colour channel by the brightness setting, the way mi_04's intensity channel
+        /// scales a lamp: linear, and rounded to nearest rather than truncated so a dim picture
+        /// does not lose a step to integer division at every level.
+        /// </summary>
+        internal static byte Scale(byte channel, byte intensity) =>
+            (byte)((channel * intensity + 127) / 255);
+
+        /// <summary>
+        /// Hand an unscaled colour map to the MCU, applying brightness on the way out.
+        ///
+        /// The scaling belongs HERE and not in the maps callers build, because mi_03 has no
+        /// intensity channel — the 176-entry map is raw RGB and the MCU draws exactly what it is
+        /// given. Every per-key picture on a board with a known layout goes through this path, so
+        /// leaving the scaling to the caller is what made the brightness slider a no-op: the value
+        /// reached <see cref="_brightness"/> and then only mi_04 ever read it, and mi_04 is the
+        /// fallback for boards this one is not.
+        ///
+        /// <paramref name="release"/> is false only for the mi_04 base layer, which is written to
+        /// be RESTORED after Fn rather than displayed now. Releasing there would hand the display
+        /// back to the MCU in the middle of an apply that is about to take it again, and the
+        /// keyboard would flick through the old effect on the way.
+        /// </summary>
+        private bool WriteColorMap(byte[] r, byte[] g, byte[] b, bool release = true)
+        {
+            if (_mcu == null) return false;
+
+            var sr = new byte[r.Length];
+            var sg = new byte[g.Length];
+            var sb = new byte[b.Length];
+            for (int i = 0; i < r.Length; i++)
+            {
+                sr[i] = Scale(r[i], _brightness);
+                sg[i] = Scale(g[i], _brightness);
+                sb[i] = Scale(b[i], _brightness);
+            }
+
             // The MCU only draws its own map while it owns the display, so release first. Taking
             // host control here is what broke the Fn overlay: it suppresses the map being written.
-            ReleaseHostControlIfHeld();
-            return _mcu.SetStaticColorMap(r, g, b);
+            if (release) ReleaseHostControlIfHeld();
+
+            bool ok = _mcu.SetStaticColorMap(sr, sg, sb);
+            if (ok)
+            {
+                _mapR = r;
+                _mapG = g;
+                _mapB = b;
+
+                // Only the MCU drawing its own map counts as displaying it. When the host holds
+                // the lamps this map is a base layer for the Fn overlay to restore to, not what
+                // is on the keyboard now, and brightness must repaint the lamps instead.
+                _mcuShowsHostMap = release && !_hostOwnsLamps;
+
+                // The colour frame carries 0x09 payload 0x01, which lights a blanked keyboard.
+                _backlightBlanked = false;
+            }
+            return ok;
+        }
+
+        /// <summary>Fill the whole colour map with one colour, through the scaling path above.</summary>
+        private bool WriteUniformColorMap(Color c, bool release = true)
+        {
+            var r = new byte[DojoKeyboardMcu.ColorMapLength];
+            var g = new byte[DojoKeyboardMcu.ColorMapLength];
+            var b = new byte[DojoKeyboardMcu.ColorMapLength];
+            Array.Fill(r, c.R);
+            Array.Fill(g, c.G);
+            Array.Fill(b, c.B);
+
+            return WriteColorMap(r, g, b, release);
         }
 
         private static Color MostCommonColor(IEnumerable<Color> colors)
@@ -543,6 +722,7 @@ namespace OmenCore.Services.KeyboardLighting
 
             bool ok = _lamps.SetAutonomousMode(true);
             _hostOwnsLamps = false;
+            _mcuShowsHostMap = false;
             return ok;
         }
 
@@ -569,6 +749,10 @@ namespace OmenCore.Services.KeyboardLighting
                     result.FailureReason = $"The MCU refused effect {record.Effect}";
                     return result;
                 }
+
+                // The animation engine is drawing now, not the static map. Brightness must not
+                // repaint it: re-sending the map would replace a running effect with a still frame.
+                _mcuShowsHostMap = false;
 
                 // The one place on this keyboard where a write can be checked. It confirms the
                 // MCU installed the effect, not that anything is visible - two effects render
@@ -817,6 +1001,10 @@ namespace OmenCore.Services.KeyboardLighting
 
             _lamps.SetAutonomousMode(false);
             _hostOwnsLamps = true;
+
+            // The MCU stops drawing the moment the host takes the lamps, so whatever map it holds
+            // is no longer on the display and re-sending it would not be a repaint of what is there.
+            _mcuShowsHostMap = false;
         }
 
         private void ReleaseHostControlIfHeld()
